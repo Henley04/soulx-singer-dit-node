@@ -1,6 +1,6 @@
 {
   "name": "soulx-singer-dit-win32-x64-cpu",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Prebuilt CPU backend for soulx-singer-dit (Windows x64)",
   "main": "index.js",
   "types": "index.d.ts",

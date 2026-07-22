@@ -16,7 +16,7 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure' }}
     permissions:
       id-token: write  # REQUIRED for npm OIDC trusted publisher / provenance
-      contents: read
+      contents: write  # Needed to create GitHub Release
       actions: read    # Needed to download artifacts from the triggering workflow_run
 
     steps:
