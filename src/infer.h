@@ -21,6 +21,10 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+  #include <windows.h>
+#endif
+
 // ---------------------------------------------------------------------------
 // Model hyperparameters (mirror convert_dit_to_gguf.py DIT_HPARAMS)
 // ---------------------------------------------------------------------------
@@ -63,6 +67,9 @@ struct Model {
     int   fd             = -1;
     void * mmap_data     = nullptr;
     size_t mmap_size     = 0;
+#ifdef _WIN32
+    HANDLE file_mapping  = nullptr;  // file mapping handle for mmap cleanup
+#endif
 
     bool load(const std::string & path_);
     void unload();

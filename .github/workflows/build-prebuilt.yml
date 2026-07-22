@@ -43,6 +43,13 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Install Ninja
+        shell: pwsh
+        run: |
+          choco install ninja -y --no-progress
+          refreshenv 2>$null
+          ninja --version
+
       - name: Install node-addon-api
         run: npm install node-addon-api
 
@@ -50,19 +57,35 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/ggml-org/llama.cpp.git vendor/llama.cpp
 
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-
-      # Ninja ships pre-installed on windows-latest GitHub runners and is much
-      # faster than the MSBuild generator for a single-target CMake project.
-      - name: Verify Ninja is available
+      # Download Node.js development headers directly from nodejs.org. This is
+      # more reliable than node-gyp install, whose cache path varies across
+      # runner images and node-gyp versions.
+      - name: Download Node.js headers
         shell: pwsh
         run: |
-          ninja --version
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Ninja not found on PATH"
+          $nodeVersion = (node -v).TrimStart('v')
+          $incDir = "$env:RUNNER_TEMP\node-headers\include\node"
+          $url = "https://nodejs.org/dist/v$nodeVersion/node-v$nodeVersion-headers.tar.gz"
+          Write-Host "Downloading headers from: $url"
+          $tgz = "$env:RUNNER_TEMP\headers.tar.gz"
+          Invoke-WebRequest -Uri $url -OutFile $tgz
+          $extractDir = "$env:RUNNER_TEMP\node-headers"
+          New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+          tar -xzf $tgz -C $extractDir --strip-components=1
+          if (-not (Test-Path "$incDir\node_api.h")) {
+            Write-Error "node_api.h not found at $incDir after extraction"
+            Get-ChildItem -Recurse $extractDir -Filter "node_api.h" | ForEach-Object { Write-Host "Found: $($_.FullName)" }
             exit 1
           }
+          Write-Host "NODE_INCLUDE_DIR=$incDir"
+          "NODE_INCLUDE_DIR=$incDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # Use VS 2022 (17.x) instead of VS 2026 (18.x). The newer MSVC 14.51
+      # toolset is too new for CUDA 12.x's host_config.h version checks.
+      - name: Setup MSVC (VS 2022)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          vs-version: '[17.0,18.0)'
 
       # Vulkan backend: install the Vulkan SDK so CMake can find glslang etc.
       - name: Install Vulkan SDK
@@ -72,8 +95,7 @@ jobs:
           version: latest
           cache: true
 
-      # CUDA backend: ensure a consistent CUDA toolkit version is on PATH.
-      # windows-latest ships a CUDA toolkit, but we pin a known-good version.
+      # CUDA backend: pin a known-good version compatible with VS 2022's MSVC.
       - name: Setup CUDA
         if: matrix.backend == 'cuda'
         uses: Jimver/cuda-toolkit@v0.2.15
@@ -81,35 +103,6 @@ jobs:
           cuda: '12.4.0'
           method: 'network'
           sub-packages: '["nvcc", "cudart", "cublas", "curand"]'
-
-      # The setup-node action installs the Node binary but NOT its development
-      # headers. The CMake project needs node_api.h etc. The most reliable way
-      # to fetch the headers that exactly match the running Node version is to
-      # let node-gyp download them, then point NODE_INCLUDE_DIR at that tree.
-      - name: Fetch Node.js headers & set NODE_INCLUDE_DIR
-        shell: pwsh
-        run: |
-          npx node-gyp install
-          $nodeVersion = (node -v).TrimStart('v')
-          $candidates = @(
-            "$env:USERPROFILE\.node-gyp\$nodeVersion\include\node",
-            "$env:LOCALAPPDATA\node-gyp\Cache\$nodeVersion\include\node",
-            "C:\Program Files\nodejs\include\node"
-          )
-          $incDir = $null
-          foreach ($c in $candidates) {
-            Write-Host "checking: $c"
-            if (Test-Path "$c\node_api.h") {
-              $incDir = $c
-              break
-            }
-          }
-          if (-not $incDir) {
-            Write-Error "Node.js headers (node_api.h) not found in any expected location"
-            exit 1
-          }
-          Write-Host "NODE_INCLUDE_DIR=$incDir"
-          "NODE_INCLUDE_DIR=$incDir" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Configure CMake
         shell: pwsh

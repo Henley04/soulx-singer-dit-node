@@ -126,9 +126,7 @@ public:
         // freed when the env tears down.
         auto* ctor = new Napi::FunctionReference();
         *ctor = Napi::Persistent(func);
-        env.SetInstanceData<Napi::FunctionReference>(ctor, [](Napi::Env, Napi::FunctionReference* ref) {
-            delete ref;
-        });
+        env.SetInstanceData<Napi::FunctionReference>(ctor);
 
         exports.Set(Napi::String::New(env, "Model"), func);
         exports.Set(Napi::String::New(env, "getVersion"),

@@ -28,16 +28,48 @@
 #include <string>
 #include <vector>
 
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
+#ifdef _WIN32
+  #include <windows.h>
+#else
+  #include <sys/mman.h>
+  #include <sys/stat.h>
+  #include <fcntl.h>
+  #include <unistd.h>
+#endif
 
 // ---------------------------------------------------------------------------
 // Model::load / Model::unload
 // ---------------------------------------------------------------------------
 bool Model::load(const std::string & path_) {
     path = path_;
+#ifdef _WIN32
+    HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "CreateFileA failed for %s (err=%lu)\n", path.c_str(), GetLastError());
+        return false;
+    }
+    LARGE_INTEGER fsz;
+    if (!GetFileSizeEx(hFile, &fsz)) {
+        fprintf(stderr, "GetFileSizeEx failed for %s (err=%lu)\n", path.c_str(), GetLastError());
+        CloseHandle(hFile);
+        return false;
+    }
+    mmap_size = (size_t)fsz.QuadPart;
+    file_mapping = CreateFileMappingA(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    CloseHandle(hFile);
+    if (!file_mapping) {
+        fprintf(stderr, "CreateFileMappingA failed for %s (err=%lu)\n", path.c_str(), GetLastError());
+        return false;
+    }
+    mmap_data = MapViewOfFile(file_mapping, FILE_MAP_READ, 0, 0, 0);
+    if (!mmap_data) {
+        fprintf(stderr, "MapViewOfFile failed for %s (err=%lu)\n", path.c_str(), GetLastError());
+        CloseHandle(file_mapping);
+        file_mapping = nullptr;
+        return false;
+    }
+#else
     fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) { perror("open"); return false; }
     struct stat sb;
@@ -45,6 +77,7 @@ bool Model::load(const std::string & path_) {
     mmap_size = (size_t)sb.st_size;
     mmap_data = mmap(nullptr, mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (mmap_data == MAP_FAILED) { perror("mmap"); mmap_data = nullptr; return false; }
+#endif
 
     gguf_init_params params;
     params.no_alloc = true;             // we'll point tensor->data at the mmap
@@ -73,8 +106,13 @@ bool Model::load(const std::string & path_) {
 void Model::unload() {
     if (gguf) gguf_free(gguf);
     if (ctx)  ggml_free(ctx);
+#ifdef _WIN32
+    if (mmap_data) { UnmapViewOfFile(mmap_data); }
+    if (file_mapping) { CloseHandle(file_mapping); file_mapping = nullptr; }
+#else
     if (mmap_data) munmap(mmap_data, mmap_size);
     if (fd >= 0) close(fd);
+#endif
     ctx = nullptr; gguf = nullptr; mmap_data = nullptr; fd = -1;
 }
 
