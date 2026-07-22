@@ -204,20 +204,23 @@ jobs:
           cmake --install "$env:RUNNER_TEMP\spirv-headers\build"
           Write-Host "SPIRV-Headers installed to: $prefix"
           Get-ChildItem -Recurse "$prefix" -Filter "*SPIRV*Config*" | ForEach-Object { Write-Host "  Found: $($_.FullName)" }
-          "SPIRV_HEADERS_PREFIX=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Append
+          # Set the exact directory for find_package(SPIRV-Headers)
+          $cmakeDir = "$prefix/share/cmake/SPIRV-Headers"
+          "SPIRV_HEADERS_DIR=$cmakeDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "SPIRV_HEADERS_DIR=$cmakeDir"
 
       - name: Configure CMake
         shell: pwsh
         run: |
-          $extraOpts = ""
-          if ("${{ matrix.backend }}" -eq "vulkan" -and $env:SPIRV_HEADERS_PREFIX) {
-            $extraOpts = "-DCMAKE_PREFIX_PATH=`"$env:SPIRV_HEADERS_PREFIX`""
+          $extraArgs = @()
+          if ("${{ matrix.backend }}" -eq "vulkan" -and $env:SPIRV_HEADERS_DIR) {
+            $extraArgs += "-DSPIRV-Headers_DIR=$env:SPIRV_HEADERS_DIR"
           }
           cmake -B build -G "Ninja" `
             -DCMAKE_BUILD_TYPE=Release `
             ${{ matrix.cmake_opts }} `
             -DNODE_INCLUDE_DIR="$env:NODE_INCLUDE_DIR" `
-            $extraOpts
+            @extraArgs
 
       - name: Build
         run: cmake --build build --config Release --parallel
