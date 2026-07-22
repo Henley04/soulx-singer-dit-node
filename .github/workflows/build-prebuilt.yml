@@ -31,7 +31,7 @@ jobs:
             cmake_opts: '-DGGML_CPU=ON -DGGML_VULKAN=ON -DGGML_CUDA=OFF'
             artifact_name: vulkan.node
           - backend: cuda
-            cmake_opts: '-DGGML_CPU=ON -DGGML_VULKAN=OFF -DGGML_CUDA=ON -DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler'
+            cmake_opts: '-DGGML_CPU=ON -DGGML_VULKAN=OFF -DGGML_CUDA=ON'
             artifact_name: cuda.node
 
     steps:
@@ -96,10 +96,8 @@ jobs:
           "NODE_INCLUDE_DIR=$incDir" | Out-File -FilePath $env:GITHUB_ENV -Append
           "NODE_LIB_DIR=$libDir" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Setup MSVC (VS 2022)
+      - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
-        with:
-          vsversion: 2022
 
       # Vulkan backend: install the Vulkan SDK and export VULKAN_SDK so CMake
       # can find it in subsequent steps.
@@ -144,7 +142,10 @@ jobs:
           "VULKAN_SDK=$sdkPath" | Out-File -FilePath $env:GITHUB_ENV -Append
           "$sdkPath\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
-      # CUDA backend: 12.4.0 is compatible with VS 2022's MSVC 14.4x.
+      # CUDA backend: 12.4.0.  The runner has VS 2026 / MSVC 14.51 which is
+      # newer than CUDA 12.4 supports.  NVCC_PREPEND_FLAGS injects
+      # -allow-unsupported-compiler into every nvcc invocation, bypassing
+      # host_config.h version checks BEFORE CMake's compiler detection.
       - name: Setup CUDA
         if: matrix.backend == 'cuda'
         uses: Jimver/cuda-toolkit@v0.2.15
@@ -152,6 +153,13 @@ jobs:
           cuda: '12.4.0'
           method: 'network'
           sub-packages: '["nvcc", "cudart", "cublas", "curand"]'
+
+      - name: Set CUDA compiler flags
+        if: matrix.backend == 'cuda'
+        shell: pwsh
+        run: |
+          "NVCC_PREPEND_FLAGS=-allow-unsupported-compiler" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "NVCC_PREPEND_FLAGS set to -allow-unsupported-compiler"
 
       - name: Configure CMake
         shell: pwsh
