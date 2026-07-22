@@ -99,58 +99,90 @@ jobs:
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
-      # Vulkan backend: install the Vulkan SDK.  We first check for a
-      # pre-installed SDK (windows-latest ships one at C:\VulkanSDK\<ver>);
-      # if absent we download the official lunarG installer and run it
-      # silently with /S.  This is more reliable than third-party actions
-      # whose extraction layout has changed across versions.
-      - name: Install Vulkan SDK
+      # Vulkan backend: build a minimal "SDK" from KhronosGroup/Vulkan-Headers
+      # (small ~3 MB tarball) plus a generated vulkan-1.lib import library.
+      # The full lunarG SDK installer (~300 MB) timed out on the runner; this
+      # approach downloads in seconds and gives CMake's find_package(Vulkan)
+      # exactly what it needs: Include/vulkan/vulkan.h + Lib/vulkan-1.lib.
+      - name: Install Vulkan SDK (minimal)
         if: matrix.backend == 'vulkan'
         shell: pwsh
         run: |
-          $sdkPath = $null
-          # 1) Check pre-installed SDK under C:\VulkanSDK\<version>
+          $sdkRoot = "$env:RUNNER_TEMP\vulkan-sdk"
+          New-Item -ItemType Directory -Force -Path "$sdkRoot\Include", "$sdkRoot\Lib" | Out-Null
+
+          # --- 1. Check for a pre-installed full SDK first ---
+          $found = $false
           if (Test-Path "C:\VulkanSDK") {
             $pre = Get-ChildItem "C:\VulkanSDK" -Directory -ErrorAction SilentlyContinue |
                    Sort-Object Name -Descending | Select-Object -First 1
-            if ($pre -and (Test-Path "$($pre.FullName)\Include\vulkan\vulkan.h")) {
-              $sdkPath = $pre.FullName
-              Write-Host "Found pre-installed Vulkan SDK: $sdkPath"
+            if ($pre -and (Test-Path "$($pre.FullName)\Include\vulkan\vulkan.h") -and
+                          (Test-Path "$($pre.FullName)\Lib\vulkan-1.lib")) {
+              $sdkRoot = $pre.FullName
+              $found = $true
+              Write-Host "Using pre-installed Vulkan SDK: $sdkRoot"
             }
           }
-          # 2) Download + silent install from lunarG
-          if (-not $sdkPath) {
-            $version = "1.3.296.0"
-            $installer = "$env:RUNNER_TEMP\VulkanSDK-$version-Installer.exe"
-            $url = "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe"
-            Write-Host "Downloading Vulkan SDK $version from $url"
-            Invoke-WebRequest -Uri $url -OutFile $installer -MaximumRedirection 10
-            Write-Host "Installing silently..."
-            $p = Start-Process -FilePath $installer -ArgumentList "/S" -Wait -PassThru
-            Write-Host "Installer exit code: $($p.ExitCode)"
-            $inst = Get-ChildItem "C:\VulkanSDK" -Directory -ErrorAction SilentlyContinue |
-                    Sort-Object Name -Descending | Select-Object -First 1
-            if ($inst -and (Test-Path "$($inst.FullName)\Include\vulkan\vulkan.h")) {
-              $sdkPath = $inst.FullName
-            }
-          }
-          if (-not $sdkPath) {
-            Write-Error "Vulkan SDK could not be located after install"
-            exit 1
-          }
-          Write-Host "VULKAN_SDK=$sdkPath"
-          "VULKAN_SDK=$sdkPath" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "$sdkPath\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
-      # CUDA backend: 12.8.1 supports MSVC 14.4x+ (VS 2022 17.10+).  Earlier
-      # 12.4 triggered cudafe++ ACCESS_VIOLATION with the runner's newer MSVC.
-      # NVCC_PREPEND_FLAGS is kept as a safety net in case the runner ships an
-      # even newer toolset than 12.8 officially supports.
+          if (-not $found) {
+            # --- 2. Download Vulkan headers from GitHub (~3 MB) ---
+            $vhVersion = "1.3.296"
+            $tarball = "$env:RUNNER_TEMP\vh.tar.gz"
+            $url = "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v$vhVersion.tar.gz"
+            Write-Host "Downloading Vulkan-Headers $vhVersion ..."
+            Invoke-WebRequest -Uri $url -OutFile $tarball
+            tar -xzf $tarball -C "$env:RUNNER_TEMP"
+            $hdrSrc = (Get-ChildItem "$env:RUNNER_TEMP\Vulkan-Headers-*" -Directory |
+                       Select-Object -First 1).FullName
+            Copy-Item "$hdrSrc\include\*" "$sdkRoot\Include\" -Recurse -Force
+            Write-Host "Headers installed to $sdkRoot\Include"
+
+            # --- 3. Generate vulkan-1.lib from the system vulkan-1.dll ---
+            # Windows ships vulkan-1.dll (the loader) in System32.  We dump its
+            # exports and create a matching import library with lib.exe.
+            $dll = "C:\Windows\System32\vulkan-1.dll"
+            $defFile = "$env:RUNNER_TEMP\vulkan.def"
+            "LIBRARY vulkan-1.dll" | Set-Content $defFile
+            "EXPORTS" | Add-Content $defFile
+            if (Test-Path $dll) {
+              Write-Host "Extracting exports from $dll ..."
+              $exports = & dumpbin /exports $dll 2>$null |
+                         Select-String -Pattern '^\s+\d+\s+[0-9A-Fa-f]+\s+\w+' |
+                         ForEach-Object { ($_ -split '\s+')[-1] }
+              if ($exports) {
+                $exports | Sort-Object -Unique | Add-Content $defFile
+              }
+            }
+            # Always ensure the 6 core Vulkan loader exports are present
+            # (in case dumpbin missed them or the DLL is absent).
+            $core = @('vkCreateInstance','vkEnumerateInstanceExtensionProperties',
+                      'vkEnumerateInstanceLayerProperties','vkEnumerateInstanceVersion',
+                      'vkGetDeviceProcAddr','vkGetInstanceProcAddr')
+            $existing = Get-Content $defFile
+            foreach ($fn in $core) {
+              if ($existing -notcontains $fn) { $fn | Add-Content $defFile }
+            }
+            & lib /def:"$defFile" /out:"$sdkRoot\Lib\vulkan-1.lib" /machine:x64 2>&1 |
+              Write-Host
+            if (-not (Test-Path "$sdkRoot\Lib\vulkan-1.lib")) {
+              Write-Error "Failed to generate vulkan-1.lib"
+              exit 1
+            }
+            Write-Host "Generated vulkan-1.lib at $sdkRoot\Lib"
+          }
+
+          Write-Host "VULKAN_SDK=$sdkRoot"
+          "VULKAN_SDK=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # CUDA backend: 12.8.0 supports MSVC 14.4x+ (VS 2022 17.10+).  The
+      # older action v0.2.15 only knew about CUDA ≤ 12.4.1; v0.2.35 fetches
+      # the version list dynamically from NVIDIA's CDN, so 12.8.0 resolves.
+      # NVCC_PREPEND_FLAGS is kept as a safety net.
       - name: Setup CUDA
         if: matrix.backend == 'cuda'
-        uses: Jimver/cuda-toolkit@v0.2.15
+        uses: Jimver/cuda-toolkit@v0.2.35
         with:
-          cuda: '12.8.1'
+          cuda: '12.8.0'
           method: 'network'
           sub-packages: '["nvcc", "cudart", "cublas", "curand"]'
 
