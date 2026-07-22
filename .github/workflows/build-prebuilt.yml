@@ -99,58 +99,58 @@ jobs:
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
-      # Vulkan backend: install the Vulkan SDK and export VULKAN_SDK so CMake
-      # can find it in subsequent steps.
+      # Vulkan backend: install the Vulkan SDK.  We first check for a
+      # pre-installed SDK (windows-latest ships one at C:\VulkanSDK\<ver>);
+      # if absent we download the official lunarG installer and run it
+      # silently with /S.  This is more reliable than third-party actions
+      # whose extraction layout has changed across versions.
       - name: Install Vulkan SDK
-        if: matrix.backend == 'vulkan'
-        uses: humbletim/install-vulkan-sdk@v1.2
-        with:
-          version: latest
-          cache: true
-
-      - name: Export VULKAN_SDK
         if: matrix.backend == 'vulkan'
         shell: pwsh
         run: |
-          # humbletim/install-vulkan-sdk installs to the workspace dir, not
-          # C:\VulkanSDK.  Search multiple locations and persist VULKAN_SDK.
-          $candidates = @()
-          if ($env:VULKAN_SDK) { $candidates += $env:VULKAN_SDK }
-          $candidates += "$env:GITHUB_WORKSPACE\VULKAN_SDK"
-          $candidates += "C:\VulkanSDK"
           $sdkPath = $null
-          foreach ($c in $candidates) {
-            Write-Host "Checking: $c"
-            if ((Test-Path $c) -and (Test-Path "$c\Include\vulkan\vulkan.h")) {
-              $sdkPath = $c
-              break
+          # 1) Check pre-installed SDK under C:\VulkanSDK\<version>
+          if (Test-Path "C:\VulkanSDK") {
+            $pre = Get-ChildItem "C:\VulkanSDK" -Directory -ErrorAction SilentlyContinue |
+                   Sort-Object Name -Descending | Select-Object -First 1
+            if ($pre -and (Test-Path "$($pre.FullName)\Include\vulkan\vulkan.h")) {
+              $sdkPath = $pre.FullName
+              Write-Host "Found pre-installed Vulkan SDK: $sdkPath"
             }
-            # Also check subdirectories (versioned)
-            if (Test-Path $c) {
-              $sub = Get-ChildItem $c -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
-              if ($sub -and (Test-Path "$($sub.FullName)\Include\vulkan\vulkan.h")) {
-                $sdkPath = $sub.FullName
-                break
-              }
+          }
+          # 2) Download + silent install from lunarG
+          if (-not $sdkPath) {
+            $version = "1.3.296.0"
+            $installer = "$env:RUNNER_TEMP\VulkanSDK-$version-Installer.exe"
+            $url = "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe"
+            Write-Host "Downloading Vulkan SDK $version from $url"
+            Invoke-WebRequest -Uri $url -OutFile $installer -MaximumRedirection 10
+            Write-Host "Installing silently..."
+            $p = Start-Process -FilePath $installer -ArgumentList "/S" -Wait -PassThru
+            Write-Host "Installer exit code: $($p.ExitCode)"
+            $inst = Get-ChildItem "C:\VulkanSDK" -Directory -ErrorAction SilentlyContinue |
+                    Sort-Object Name -Descending | Select-Object -First 1
+            if ($inst -and (Test-Path "$($inst.FullName)\Include\vulkan\vulkan.h")) {
+              $sdkPath = $inst.FullName
             }
           }
           if (-not $sdkPath) {
-            Write-Error "Vulkan SDK not found in any expected location"
+            Write-Error "Vulkan SDK could not be located after install"
             exit 1
           }
           Write-Host "VULKAN_SDK=$sdkPath"
           "VULKAN_SDK=$sdkPath" | Out-File -FilePath $env:GITHUB_ENV -Append
           "$sdkPath\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
-      # CUDA backend: 12.4.0.  The runner has VS 2026 / MSVC 14.51 which is
-      # newer than CUDA 12.4 supports.  NVCC_PREPEND_FLAGS injects
-      # -allow-unsupported-compiler into every nvcc invocation, bypassing
-      # host_config.h version checks BEFORE CMake's compiler detection.
+      # CUDA backend: 12.8.1 supports MSVC 14.4x+ (VS 2022 17.10+).  Earlier
+      # 12.4 triggered cudafe++ ACCESS_VIOLATION with the runner's newer MSVC.
+      # NVCC_PREPEND_FLAGS is kept as a safety net in case the runner ships an
+      # even newer toolset than 12.8 officially supports.
       - name: Setup CUDA
         if: matrix.backend == 'cuda'
         uses: Jimver/cuda-toolkit@v0.2.15
         with:
-          cuda: '12.4.0'
+          cuda: '12.8.1'
           method: 'network'
           sub-packages: '["nvcc", "cudart", "cublas", "curand"]'
 
@@ -204,6 +204,8 @@ jobs:
     name: Collect and Prepare Packages
     needs: build
     runs-on: ubuntu-latest
+    # Run even if some matrix legs failed — we publish whatever built.
+    if: always()
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -216,9 +218,15 @@ jobs:
       - name: Place .node files in subpackages
         run: |
           mkdir -p packages/win32-x64-cpu packages/win32-x64-vulkan packages/win32-x64-cuda
-          cp artifacts/cpu-node/cpu.node packages/win32-x64-cpu/
-          cp artifacts/vulkan-node/vulkan.node packages/win32-x64-vulkan/
-          cp artifacts/cuda-node/cuda.node packages/win32-x64-cuda/
+          for backend in cpu vulkan cuda; do
+            src="artifacts/${backend}-node/${backend}.node"
+            if [ -f "$src" ]; then
+              cp "$src" "packages/win32-x64-${backend}/"
+              echo "Collected: ${backend}"
+            else
+              echo "MISSING: ${backend} (will skip publish for this backend)"
+            fi
+          done
           ls -la packages/win32-x64-*/
 
       - name: Upload complete packages

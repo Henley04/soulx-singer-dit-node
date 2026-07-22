@@ -11,7 +11,9 @@ jobs:
   publish:
     name: Publish packages
     runs-on: ubuntu-latest
-    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    # Run on any completed build (success OR failure, since collect runs
+    # `if: always()` and uploads whatever backends built), or on manual dispatch.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure' }}
     permissions:
       id-token: write  # REQUIRED for npm OIDC trusted publisher / provenance
       contents: read
@@ -85,10 +87,16 @@ jobs:
         run: |
           mkdir -p packages-tmp
           unzip prebuilt.zip -d packages-tmp
-          # Copy .node files into the subpackage dirs checked out from git.
-          cp packages-tmp/win32-x64-cpu/cpu.node packages/win32-x64-cpu/
-          cp packages-tmp/win32-x64-vulkan/vulkan.node packages/win32-x64-vulkan/
-          cp packages-tmp/win32-x64-cuda/cuda.node packages/win32-x64-cuda/
+          # Copy whichever .node files exist into the subpackage dirs.
+          for backend in cpu vulkan cuda; do
+            src="packages-tmp/win32-x64-${backend}/${backend}.node"
+            if [ -f "$src" ]; then
+              cp "$src" "packages/win32-x64-${backend}/"
+              echo "Present: ${backend}"
+            else
+              echo "Absent:  ${backend} (will skip its publish step)"
+            fi
+          done
           ls -la packages/win32-x64-*/
 
       - name: Read version from package.json
@@ -96,21 +104,26 @@ jobs:
         run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
 
       - name: Publish CPU subpackage
+        if: hashFiles('packages/win32-x64-cpu/cpu.node') != ''
         run: |
           cd packages/win32-x64-cpu
           npm publish --provenance --access public
 
       - name: Publish Vulkan subpackage
+        if: hashFiles('packages/win32-x64-vulkan/vulkan.node') != ''
         run: |
           cd packages/win32-x64-vulkan
           npm publish --provenance --access public
 
       - name: Publish CUDA subpackage
+        if: hashFiles('packages/win32-x64-cuda/cuda.node') != ''
         run: |
           cd packages/win32-x64-cuda
           npm publish --provenance --access public
 
       - name: Publish main package
+        # Only publish the umbrella package if at least one backend built.
+        if: hashFiles('packages/win32-x64-cpu/cpu.node') != '' || hashFiles('packages/win32-x64-vulkan/vulkan.node') != '' || hashFiles('packages/win32-x64-cuda/cuda.node') != ''
         run: |
           npm publish --provenance --access public
 
