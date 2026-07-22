@@ -159,10 +159,34 @@ else()
     target_compile_options(soulx_singer_dit PRIVATE -fexceptions)
 endif()
 
-# Link ggml (pulls in ggml-base + whichever backends are enabled). No extra
-# link line is needed for Node.js itself — N-API symbols resolve from the
-# host node process at load time on every platform.
+# Link ggml (pulls in ggml-base + whichever backends are enabled).
 target_link_libraries(soulx_singer_dit PRIVATE ggml)
+
+# On Windows, N-API symbols do NOT resolve from the host node process at
+# link time — unlike Linux/macOS, the Windows linker requires an explicit
+# import library (node.lib).  We look for it via NODE_LIB_DIR (set by CI)
+# or relative to the Node headers tree.
+if(WIN32)
+    # Try NODE_LIB_DIR environment variable first (most reliable, set by CI).
+    if(DEFINED ENV{NODE_LIB_DIR})
+        find_library(NODE_LIB node PATHS "$ENV{NODE_LIB_DIR}" NO_DEFAULT_PATH)
+    endif()
+    # Fall back: search relative to the include directory.
+    if(NOT NODE_LIB AND NODE_INCLUDE_DIRS)
+        get_filename_component(_inc_dir "${NODE_INCLUDE_DIRS}" PATH)        # .../include
+        get_filename_component(_inc_root "${_inc_dir}" PATH)               # .../node-headers
+        find_library(NODE_LIB node PATHS "${_inc_root}/lib" "${_inc_dir}/lib" NO_DEFAULT_PATH)
+    endif()
+    if(NODE_LIB)
+        target_link_libraries(soulx_singer_dit PRIVATE ${NODE_LIB})
+        message(STATUS "  NODE_LIB       = ${NODE_LIB}")
+    else()
+        message(FATAL_ERROR
+            "node.lib not found on Windows.\n"
+            "Set NODE_LIB_DIR env var to the directory containing node.lib, or\n"
+            "download it from https://nodejs.org/dist/<version>/win-x64/node.lib")
+    endif()
+endif()
 
 # ---------------------------------------------------------------------------
 # Installation: drop the .node file somewhere predictable. cmake-js usually

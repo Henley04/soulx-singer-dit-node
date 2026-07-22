@@ -31,7 +31,7 @@ jobs:
             cmake_opts: '-DGGML_CPU=ON -DGGML_VULKAN=ON -DGGML_CUDA=OFF'
             artifact_name: vulkan.node
           - backend: cuda
-            cmake_opts: '-DGGML_CPU=ON -DGGML_VULKAN=OFF -DGGML_CUDA=ON'
+            cmake_opts: '-DGGML_CPU=ON -DGGML_VULKAN=OFF -DGGML_CUDA=ON -DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler'
             artifact_name: cuda.node
 
     steps:
@@ -57,37 +57,50 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/ggml-org/llama.cpp.git vendor/llama.cpp
 
-      # Download Node.js development headers directly from nodejs.org. This is
-      # more reliable than node-gyp install, whose cache path varies across
-      # runner images and node-gyp versions.
-      - name: Download Node.js headers
+      # Download Node.js development headers AND node.lib (import library)
+      # directly from nodejs.org.  On Windows the linker needs node.lib to
+      # resolve napi_* symbols — they are NOT resolved from the host process
+      # at link time like on Linux/macOS.
+      - name: Download Node.js headers & node.lib
         shell: pwsh
         run: |
           $nodeVersion = (node -v).TrimStart('v')
-          $incDir = "$env:RUNNER_TEMP\node-headers\include\node"
-          $url = "https://nodejs.org/dist/v$nodeVersion/node-v$nodeVersion-headers.tar.gz"
-          Write-Host "Downloading headers from: $url"
-          $tgz = "$env:RUNNER_TEMP\headers.tar.gz"
-          Invoke-WebRequest -Uri $url -OutFile $tgz
-          $extractDir = "$env:RUNNER_TEMP\node-headers"
-          New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
-          tar -xzf $tgz -C $extractDir --strip-components=1
-          if (-not (Test-Path "$incDir\node_api.h")) {
-            Write-Error "node_api.h not found at $incDir after extraction"
-            Get-ChildItem -Recurse $extractDir -Filter "node_api.h" | ForEach-Object { Write-Host "Found: $($_.FullName)" }
+          $baseDir = "$env:RUNNER_TEMP\node-deps"
+          New-Item -ItemType Directory -Force -Path $baseDir | Out-Null
+          # --- Headers ---
+          $headersUrl = "https://nodejs.org/dist/v$nodeVersion/node-v$nodeVersion-headers.tar.gz"
+          Write-Host "Downloading headers: $headersUrl"
+          Invoke-WebRequest -Uri $headersUrl -OutFile "$env:RUNNER_TEMP\headers.tar.gz"
+          tar -xzf "$env:RUNNER_TEMP\headers.tar.gz" -C $baseDir
+          # Find node_api.h recursively (tar extracts to a versioned subdir)
+          $nodeApiFile = Get-ChildItem -Recurse $baseDir -Filter "node_api.h" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $nodeApiFile) {
+            Write-Error "node_api.h not found after extraction"
+            Get-ChildItem -Recurse $baseDir | ForEach-Object { Write-Host "  $($_.FullName)" }
             exit 1
           }
+          $incDir = $nodeApiFile.DirectoryName
           Write-Host "NODE_INCLUDE_DIR=$incDir"
+          # --- node.lib (Windows import library) ---
+          $libDir = "$baseDir\lib"
+          New-Item -ItemType Directory -Force -Path $libDir | Out-Null
+          $libUrl = "https://nodejs.org/dist/v$nodeVersion/win-x64/node.lib"
+          Write-Host "Downloading node.lib: $libUrl"
+          Invoke-WebRequest -Uri $libUrl -OutFile "$libDir\node.lib"
+          if (-not (Test-Path "$libDir\node.lib")) {
+            Write-Error "Failed to download node.lib"
+            exit 1
+          }
+          Write-Host "NODE_LIB_DIR=$libDir"
+          # Export for subsequent steps
           "NODE_INCLUDE_DIR=$incDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "NODE_LIB_DIR=$libDir" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      # Use VS 2022 (17.x) instead of VS 2026 (18.x). The newer MSVC 14.51
-      # toolset is too new for CUDA 12.x's host_config.h version checks.
-      - name: Setup MSVC (VS 2022)
+      - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
-        with:
-          vs-version: '[17.0,18.0)'
 
-      # Vulkan backend: install the Vulkan SDK so CMake can find glslang etc.
+      # Vulkan backend: install the Vulkan SDK and export VULKAN_SDK so CMake
+      # can find it in subsequent steps.
       - name: Install Vulkan SDK
         if: matrix.backend == 'vulkan'
         uses: humbletim/install-vulkan-sdk@v1.2
@@ -95,7 +108,31 @@ jobs:
           version: latest
           cache: true
 
-      # CUDA backend: pin a known-good version compatible with VS 2022's MSVC.
+      - name: Export VULKAN_SDK
+        if: matrix.backend == 'vulkan'
+        shell: pwsh
+        run: |
+          # humbletim/install-vulkan-sdk may not persist VULKAN_SDK across
+          # steps, so find the installed SDK and export it explicitly.
+          $sdkDirs = Get-ChildItem "C:\VulkanSDK" -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending
+          if ($sdkDirs) {
+            $sdkPath = $sdkDirs[0].FullName
+            Write-Host "VULKAN_SDK=$sdkPath"
+            "VULKAN_SDK=$sdkPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+            "$sdkPath\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          } else {
+            # Fallback: check VULKAN_SDK env var set by the installer
+            if ($env:VULKAN_SDK) {
+              Write-Host "VULKAN_SDK already set: $env:VULKAN_SDK"
+            } else {
+              Write-Error "Vulkan SDK not found in C:\VulkanSDK or env var"
+              exit 1
+            }
+          }
+
+      # CUDA backend: 12.4.0 is compatible with MSVC 14.4x.  The
+      # -allow-unsupported-compiler flag in cmake_opts bypasses host_config.h
+      # version checks for newer MSVC if needed.
       - name: Setup CUDA
         if: matrix.backend == 'cuda'
         uses: Jimver/cuda-toolkit@v0.2.15
@@ -115,16 +152,13 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
-      # The CMake project always emits soulx_singer_dit.node; rename it to the
-      # backend-specific name and drop it into the matching subpackage dir so
-      # the collect job (and the publish workflow) can pick it up verbatim.
       - name: Rename .node file
         shell: pwsh
         run: |
           $src = "build/soulx_singer_dit.node"
           if (-not (Test-Path $src)) { $src = "build/Release/soulx_singer_dit.node" }
           if (-not (Test-Path $src)) {
-            Write-Error "Build output not found at build/soulx_singer_dit.node or build/Release/soulx_singer_dit.node"
+            Write-Error "Build output not found"
             Get-ChildItem -Recurse build -Filter "*.node" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
             exit 1
           }
@@ -133,9 +167,6 @@ jobs:
           Copy-Item $src $dest -Force
           Write-Host "Produced: $dest"
 
-      # Make sure the freshly built .node actually dlopens under Node before we
-      # upload it — a failed link (e.g. missing DLL) is caught here rather than
-      # after publish.
       - name: Verify .node loads
         shell: pwsh
         run: |
