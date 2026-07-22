@@ -149,7 +149,7 @@ jobs:
           node -e "try { require('./packages/win32-x64-${{ matrix.backend }}/${{ matrix.backend }}.node'); console.log('LOAD OK'); } catch(e) { console.error('LOAD FAIL:', e.message); exit(1); }"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.backend }}-node
           path: packages/win32-x64-${{ matrix.backend }}/${{ matrix.backend }}.node
@@ -178,7 +178,7 @@ jobs:
           ls -la packages/win32-x64-*/
 
       - name: Upload complete packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: prebuilt-packages
           path: packages/
