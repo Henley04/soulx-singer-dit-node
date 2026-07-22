@@ -32,14 +32,13 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       # ---------------------------------------------------------------------
-      # Authentication: npm OIDC trusted publisher.
+      # Authentication: npm token (NPM_TOKEN secret) with provenance.
       #
-      # With the package linked to this GitHub Actions workflow on npm
-      # (Trusted Publishers), `npm publish --provenance` authenticates via an
-      # OIDC token exchange. No long-lived NPM_TOKEN is required and none is
-      # set here. The `id-token: write` permission above is what allows the
-      # OIDC claim to be minted. Do NOT add a NODE_AUTH_TOKEN env var — that
-      # would override the OIDC flow.
+      # TODO: Once OIDC trusted publisher is configured on npm for all four
+      # packages, remove the NODE_AUTH_TOKEN env vars below and rely on
+      # `npm publish --provenance` OIDC exchange exclusively.  Until then,
+      # the NPM_TOKEN secret provides authentication and --provenance still
+      # generates a signed provenance attestation.
       # ---------------------------------------------------------------------
 
       - name: Download prebuilt artifacts
@@ -87,6 +86,8 @@ jobs:
         run: |
           mkdir -p packages-tmp
           unzip prebuilt.zip -d packages-tmp
+          # Remove any stale .node files from the repo checkout first.
+          rm -f packages/win32-x64-*/*.node
           # Copy whichever .node files exist into the subpackage dirs.
           for backend in cpu vulkan cuda; do
             src="packages-tmp/win32-x64-${backend}/${backend}.node"
@@ -108,24 +109,32 @@ jobs:
         run: |
           cd packages/win32-x64-cpu
           npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish Vulkan subpackage
         if: hashFiles('packages/win32-x64-vulkan/vulkan.node') != ''
         run: |
           cd packages/win32-x64-vulkan
           npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish CUDA subpackage
         if: hashFiles('packages/win32-x64-cuda/cuda.node') != ''
         run: |
           cd packages/win32-x64-cuda
           npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish main package
         # Only publish the umbrella package if at least one backend built.
         if: hashFiles('packages/win32-x64-cpu/cpu.node') != '' || hashFiles('packages/win32-x64-vulkan/vulkan.node') != '' || hashFiles('packages/win32-x64-cuda/cuda.node') != ''
         run: |
           npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

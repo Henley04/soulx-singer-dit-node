@@ -8,7 +8,6 @@ Debug/
 *.dll
 *.dylib
 *.node
-!packages/win32-x64-*/*.node
 
 # Dependencies
 node_modules/

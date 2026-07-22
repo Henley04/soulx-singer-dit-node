@@ -172,14 +172,14 @@ jobs:
       # CUDA backend: 12.8.0 supports MSVC 14.4x+ (VS 2022 17.10+).  The
       # older action v0.2.15 only knew about CUDA ≤ 12.4.1; v0.2.35 fetches
       # the version list dynamically from NVIDIA's CDN, so 12.8.0 resolves.
-      # NVCC_PREPEND_FLAGS is kept as a safety net.
+      # No sub-packages filter — the full toolkit ensures cublas.lib and
+      # headers are present so CMake can create the CUDA::cublas target.
       - name: Setup CUDA
         if: matrix.backend == 'cuda'
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: '12.8.0'
           method: 'network'
-          sub-packages: '["nvcc", "cudart", "cublas", "curand"]'
 
       - name: Set CUDA compiler flags
         if: matrix.backend == 'cuda'
@@ -188,13 +188,36 @@ jobs:
           "NVCC_PREPEND_FLAGS=-allow-unsupported-compiler" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "NVCC_PREPEND_FLAGS set to -allow-unsupported-compiler"
 
+      # SPIRV-Headers: llama.cpp's ggml-vulkan CMakeLists does
+      # find_package(SPIRV-Headers REQUIRED), which needs a
+      # SPIRV-HeadersConfig.cmake file.  The Vulkan SDK extraction
+      # doesn't always include this CMake config, so clone the
+      # KhronosGroup/SPIRV-Headers repo and install it to a prefix
+      # that we pass to CMake via CMAKE_PREFIX_PATH.
+      - name: Install SPIRV-Headers
+        if: matrix.backend == 'vulkan'
+        shell: pwsh
+        run: |
+          $prefix = "$env:RUNNER_TEMP\spirv-headers-install"
+          git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git "$env:RUNNER_TEMP\spirv-headers"
+          cmake -S "$env:RUNNER_TEMP\spirv-headers" -B "$env:RUNNER_TEMP\spirv-headers\build" -DCMAKE_INSTALL_PREFIX="$prefix"
+          cmake --install "$env:RUNNER_TEMP\spirv-headers\build"
+          Write-Host "SPIRV-Headers installed to: $prefix"
+          Get-ChildItem -Recurse "$prefix" -Filter "*SPIRV*Config*" | ForEach-Object { Write-Host "  Found: $($_.FullName)" }
+          "SPIRV_HEADERS_PREFIX=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Configure CMake
         shell: pwsh
         run: |
+          $extraOpts = ""
+          if ("${{ matrix.backend }}" -eq "vulkan" -and $env:SPIRV_HEADERS_PREFIX) {
+            $extraOpts = "-DCMAKE_PREFIX_PATH=`"$env:SPIRV_HEADERS_PREFIX`""
+          }
           cmake -B build -G "Ninja" `
             -DCMAKE_BUILD_TYPE=Release `
             ${{ matrix.cmake_opts }} `
-            -DNODE_INCLUDE_DIR="$env:NODE_INCLUDE_DIR"
+            -DNODE_INCLUDE_DIR="$env:NODE_INCLUDE_DIR" `
+            $extraOpts
 
       - name: Build
         run: cmake --build build --config Release --parallel
@@ -245,6 +268,9 @@ jobs:
       - name: Place .node files in subpackages
         run: |
           mkdir -p packages/win32-x64-cpu packages/win32-x64-vulkan packages/win32-x64-cuda
+          # Remove any stale .node files from the repo checkout so we don't
+          # accidentally publish old/placeholder binaries.
+          rm -f packages/win32-x64-*/*.node
           for backend in cpu vulkan cuda; do
             src="artifacts/${backend}-node/${backend}.node"
             if [ -f "$src" ]; then
