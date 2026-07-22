@@ -41,7 +41,7 @@ jobs:
       # ---------------------------------------------------------------------
 
       - name: Download prebuilt artifacts
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             // Download the 'prebuilt-packages' artifact from the triggering
