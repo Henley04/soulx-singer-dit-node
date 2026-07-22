@@ -1,0 +1,20 @@
+// cuda.node — PLACEHOLDER FILE
+//
+// This is NOT a real Node.js native addon. It is a placeholder committed to
+// the repository so that the subpackage layout is complete and the loader
+// (index.js) has a target to reference during local development.
+//
+// The actual prebuilt `cuda.node` binary is produced by CI (see
+// .github/workflows) which compiles src/binding.cc against the modified
+// llama.cpp sources (with GGML_CUDA=ON) and uploads the resulting .node as
+// a build artifact. Before publishing `soulx-singer-dit-win32-x64-cuda` to
+// npm, CI replaces this placeholder with the real compiled binary for
+// win32-x64 (CUDA GPU build).
+//
+// DO NOT require this file directly in production — it will fail to load as
+// a native addon. Use the main `soulx-singer-dit` package, which selects and
+// loads the appropriate prebuilt subpackage for your platform.
+//
+// Build target: win32-x64, NVIDIA CUDA backend (requires the CUDA runtime
+// and cuBLAS at runtime; an NVIDIA GPU with a compatible driver is needed
+// for acceleration).

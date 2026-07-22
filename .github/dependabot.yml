@@ -1,0 +1,30 @@
+# Dependabot configuration — keep GitHub Actions versions current.
+version: 2
+updates:
+  # Version updates for actions used in .github/workflows/*.yml
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: ci
+      include: scope
+
+  # Version updates for npm dependencies declared in the root package.json.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - npm
+    commit-message:
+      prefix: chore
+      include: scope

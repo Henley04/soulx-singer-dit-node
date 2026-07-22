@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate (package.json, JS, YAML)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # node-addon-api is referenced by the native binding and by CMakeLists.txt
+      # (node_modules/node-addon-api/napi.h). Installing it here lets the
+      # checkout pass a basic "can CMake find the header" sanity check on CI
+      # even though we do not actually compile the native addon in this job.
+      - name: Install node-addon-api
+        run: npm install node-addon-api
+
+      - name: Validate all package.json files parse
+        run: |
+          set -e
+          status=0
+          # Find every package.json except those under node_modules.
+          while IFS= read -r f; do
+            if node -e "JSON.parse(require('fs').readFileSync('$f','utf8'))" 2>/dev/null; then
+              echo "OK  $f"
+            else
+              echo "FAIL $f (invalid JSON)"
+              status=1
+            fi
+          done < <(find . -name package.json -not -path './node_modules/*')
+          exit $status
+
+      - name: Validate all .js files have valid syntax
+        run: |
+          set -e
+          status=0
+          # `node --check` parses without executing; safe for files that would
+          # otherwise dlopen a native module or touch the filesystem.
+          while IFS= read -r f; do
+            if node --check "$f" 2>/dev/null; then
+              echo "OK  $f"
+            else
+              echo "FAIL $f (syntax error)"
+              node --check "$f" || true
+              status=1
+            fi
+          done < <(find . -name '*.js' -not -path './node_modules/*')
+          exit $status
+
+      - name: Validate workflow YAML syntax
+        run: |
+          python3 -m pip install --quiet pyyaml
+          set -e
+          status=0
+          for f in .github/workflows/*.yml .github/workflows/*.yaml .github/dependabot.yml; do
+            [ -f "$f" ] || continue
+            if python3 -c "import yaml,sys; yaml.safe_load(open('$f'))" 2>/dev/null; then
+              echo "OK  $f"
+            else
+              echo "FAIL $f (invalid YAML)"
+              python3 -c "import yaml; yaml.safe_load(open('$f'))" || true
+              status=1
+            fi
+          done
+          exit $status

@@ -1,0 +1,18 @@
+// cpu.node — PLACEHOLDER FILE
+//
+// This is NOT a real Node.js native addon. It is a placeholder committed to
+// the repository so that the subpackage layout is complete and the loader
+// (index.js) has a target to reference during local development.
+//
+// The actual prebuilt `cpu.node` binary is produced by CI (see
+// .github/workflows) which compiles src/binding.cc against the modified
+// llama.cpp sources and uploads the resulting .node as a build artifact.
+// Before publishing `soulx-singer-dit-win32-x64-cpu` to npm, CI replaces
+// this placeholder with the real compiled binary for win32-x64 (CPU build,
+// no GPU acceleration).
+//
+// DO NOT require this file directly in production — it will fail to load as
+// a native addon. Use the main `soulx-singer-dit` package, which selects and
+// loads the appropriate prebuilt subpackage for your platform.
+//
+// Build target: win32-x64, CPU only (ggml backend).

@@ -1,0 +1,69 @@
+# .npmignore for soulx-singer-dit (main package)
+#
+# The published main package should be tiny: it is a JS shim plus types and
+# docs. All native build artifacts, sources, vendored deps, examples, tests,
+# and model files are excluded — they either do not belong in the published
+# package or are shipped via the platform-specific subpackages.
+
+# --- Exclude native build inputs & sources (not needed by consumers) ---
+src/
+vendor/
+CMakeLists.txt
+*.cmake
+CMakeFiles/
+
+# --- Exclude CI / repo metadata ---
+.github/
+.git/
+.gitignore
+.gitattributes
+
+# --- Exclude examples & tests (kept in the repo, not published) ---
+examples/
+test/
+
+# --- Exclude model & weight files (never publish binaries) ---
+*.gguf
+*.bin
+*.gguf.tmp
+
+# --- Exclude build output / intermediate artifacts ---
+build/
+build/Release/
+build/Debug/
+*.obj
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.node
+
+# --- Exclude editor / OS cruft ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.log
+
+# --- Exclude lockfiles (consumers resolve their own) ---
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# --- Exclude tooling config not needed at runtime ---
+.eslintrc*
+.prettierrc*
+tsconfig.json
+.nycrc*
+
+# --- Explicitly INCLUDE (overrides above where needed) ---
+# The `files` field in package.json is the authoritative allowlist, but we
+# keep this .npmignore as a belt-and-suspenders for `npm pack` runs that do
+# not consult `files`. The entries below un-ignore the shipped assets.
+!index.js
+!index.d.ts
+!scripts/postinstall.js
+!README.md
+!docs/

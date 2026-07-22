@@ -1,0 +1,186 @@
+name: Build Prebuilt Binaries
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v0.1.0)'
+        required: false
+        type: string
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: build-prebuilt-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.backend }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: cpu
+            cmake_opts: '-DGGML_CPU=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF'
+            artifact_name: cpu.node
+          - backend: vulkan
+            cmake_opts: '-DGGML_CPU=ON -DGGML_VULKAN=ON -DGGML_CUDA=OFF'
+            artifact_name: vulkan.node
+          - backend: cuda
+            cmake_opts: '-DGGML_CPU=ON -DGGML_VULKAN=OFF -DGGML_CUDA=ON'
+            artifact_name: cuda.node
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install node-addon-api
+        run: npm install node-addon-api
+
+      - name: Clone llama.cpp
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git vendor/llama.cpp
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # Ninja ships pre-installed on windows-latest GitHub runners and is much
+      # faster than the MSBuild generator for a single-target CMake project.
+      - name: Verify Ninja is available
+        shell: pwsh
+        run: |
+          ninja --version
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Ninja not found on PATH"
+            exit 1
+          }
+
+      # Vulkan backend: install the Vulkan SDK so CMake can find glslang etc.
+      - name: Install Vulkan SDK
+        if: matrix.backend == 'vulkan'
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: latest
+          cache: true
+
+      # CUDA backend: ensure a consistent CUDA toolkit version is on PATH.
+      # windows-latest ships a CUDA toolkit, but we pin a known-good version.
+      - name: Setup CUDA
+        if: matrix.backend == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.15
+        with:
+          cuda: '12.4.0'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "cublas", "curand"]'
+
+      # The setup-node action installs the Node binary but NOT its development
+      # headers. The CMake project needs node_api.h etc. The most reliable way
+      # to fetch the headers that exactly match the running Node version is to
+      # let node-gyp download them, then point NODE_INCLUDE_DIR at that tree.
+      - name: Fetch Node.js headers & set NODE_INCLUDE_DIR
+        shell: pwsh
+        run: |
+          npx node-gyp install
+          $nodeVersion = (node -v).TrimStart('v')
+          $candidates = @(
+            "$env:USERPROFILE\.node-gyp\$nodeVersion\include\node",
+            "$env:LOCALAPPDATA\node-gyp\Cache\$nodeVersion\include\node",
+            "C:\Program Files\nodejs\include\node"
+          )
+          $incDir = $null
+          foreach ($c in $candidates) {
+            Write-Host "checking: $c"
+            if (Test-Path "$c\node_api.h") {
+              $incDir = $c
+              break
+            }
+          }
+          if (-not $incDir) {
+            Write-Error "Node.js headers (node_api.h) not found in any expected location"
+            exit 1
+          }
+          Write-Host "NODE_INCLUDE_DIR=$incDir"
+          "NODE_INCLUDE_DIR=$incDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake -B build -G "Ninja" `
+            -DCMAKE_BUILD_TYPE=Release `
+            ${{ matrix.cmake_opts }} `
+            -DNODE_INCLUDE_DIR="$env:NODE_INCLUDE_DIR"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      # The CMake project always emits soulx_singer_dit.node; rename it to the
+      # backend-specific name and drop it into the matching subpackage dir so
+      # the collect job (and the publish workflow) can pick it up verbatim.
+      - name: Rename .node file
+        shell: pwsh
+        run: |
+          $src = "build/soulx_singer_dit.node"
+          if (-not (Test-Path $src)) { $src = "build/Release/soulx_singer_dit.node" }
+          if (-not (Test-Path $src)) {
+            Write-Error "Build output not found at build/soulx_singer_dit.node or build/Release/soulx_singer_dit.node"
+            Get-ChildItem -Recurse build -Filter "*.node" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+            exit 1
+          }
+          $dest = "packages/win32-x64-${{ matrix.backend }}/${{ matrix.backend }}.node"
+          New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
+          Copy-Item $src $dest -Force
+          Write-Host "Produced: $dest"
+
+      # Make sure the freshly built .node actually dlopens under Node before we
+      # upload it — a failed link (e.g. missing DLL) is caught here rather than
+      # after publish.
+      - name: Verify .node loads
+        shell: pwsh
+        run: |
+          node -e "try { require('./packages/win32-x64-${{ matrix.backend }}/${{ matrix.backend }}.node'); console.log('LOAD OK'); } catch(e) { console.error('LOAD FAIL:', e.message); exit(1); }"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.backend }}-node
+          path: packages/win32-x64-${{ matrix.backend }}/${{ matrix.backend }}.node
+          retention-days: 30
+          if-no-files-found: error
+
+  collect:
+    name: Collect and Prepare Packages
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Place .node files in subpackages
+        run: |
+          mkdir -p packages/win32-x64-cpu packages/win32-x64-vulkan packages/win32-x64-cuda
+          cp artifacts/cpu-node/cpu.node packages/win32-x64-cpu/
+          cp artifacts/vulkan-node/vulkan.node packages/win32-x64-vulkan/
+          cp artifacts/cuda-node/cuda.node packages/win32-x64-cuda/
+          ls -la packages/win32-x64-*/
+
+      - name: Upload complete packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-packages
+          path: packages/
+          retention-days: 30
+          if-no-files-found: error

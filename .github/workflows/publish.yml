@@ -1,0 +1,121 @@
+name: Publish to npm
+
+on:
+  workflow_run:
+    workflows: ["Build Prebuilt Binaries"]
+    types:
+      - completed
+  workflow_dispatch:
+
+jobs:
+  publish:
+    name: Publish packages
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    permissions:
+      id-token: write  # REQUIRED for npm OIDC trusted publisher / provenance
+      contents: read
+      actions: read    # Needed to download artifacts from the triggering workflow_run
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          # registry-url configures ~/.npmrc with the registry; no token is
+          # written because authentication is handled via OIDC below.
+          registry-url: 'https://registry.npmjs.org'
+
+      # ---------------------------------------------------------------------
+      # Authentication: npm OIDC trusted publisher.
+      #
+      # With the package linked to this GitHub Actions workflow on npm
+      # (Trusted Publishers), `npm publish --provenance` authenticates via an
+      # OIDC token exchange. No long-lived NPM_TOKEN is required and none is
+      # set here. The `id-token: write` permission above is what allows the
+      # OIDC claim to be minted. Do NOT add a NODE_AUTH_TOKEN env var — that
+      # would override the OIDC flow.
+      # ---------------------------------------------------------------------
+
+      - name: Download prebuilt artifacts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Download the 'prebuilt-packages' artifact from the triggering
+            // workflow run (or, for a manual dispatch, the most recent one).
+            const fs = require('fs');
+            const path = require('path');
+
+            let artifacts;
+            if (context.eventName === 'workflow_dispatch') {
+              // For manual dispatch, list recent artifacts of this name.
+              artifacts = await github.rest.actions.listArtifactsForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'prebuilt-packages',
+                per_page: 5
+              });
+            } else {
+              // For workflow_run trigger, get artifacts from the triggering run.
+              artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: context.payload.workflow_run.id,
+              });
+            }
+
+            const matchArtifact = artifacts.data.artifacts.find(a => a.name === 'prebuilt-packages');
+            if (!matchArtifact) {
+              core.setFailed('prebuilt-packages artifact not found');
+              return;
+            }
+
+            const download = await github.rest.actions.downloadArtifact({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              artifact_id: matchArtifact.id,
+              archive_format: 'zip',
+            });
+            fs.writeFileSync('prebuilt.zip', Buffer.from(download.data));
+
+      - name: Extract artifacts
+        run: |
+          mkdir -p packages-tmp
+          unzip prebuilt.zip -d packages-tmp
+          # Copy .node files into the subpackage dirs checked out from git.
+          cp packages-tmp/win32-x64-cpu/cpu.node packages/win32-x64-cpu/
+          cp packages-tmp/win32-x64-vulkan/vulkan.node packages/win32-x64-vulkan/
+          cp packages-tmp/win32-x64-cuda/cuda.node packages/win32-x64-cuda/
+          ls -la packages/win32-x64-*/
+
+      - name: Read version from package.json
+        id: version
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+
+      - name: Publish CPU subpackage
+        run: |
+          cd packages/win32-x64-cpu
+          npm publish --provenance --access public
+
+      - name: Publish Vulkan subpackage
+        run: |
+          cd packages/win32-x64-vulkan
+          npm publish --provenance --access public
+
+      - name: Publish CUDA subpackage
+        run: |
+          cd packages/win32-x64-cuda
+          npm publish --provenance --access public
+
+      - name: Publish main package
+        run: |
+          npm publish --provenance --access public
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.VERSION }}
+          generate_release_notes: true

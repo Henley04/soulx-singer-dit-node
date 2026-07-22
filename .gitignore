@@ -1,0 +1,40 @@
+# Build artifacts
+build/
+Release/
+Debug/
+*.o
+*.obj
+*.so
+*.dll
+*.dylib
+*.node
+!packages/win32-x64-*/*.node
+
+# Dependencies
+node_modules/
+vendor/llama.cpp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Model files (too large for git)
+*.gguf
+
+# npm publish artifacts
+*.tgz
+
+# Temporary
+tmp/
+.cache/

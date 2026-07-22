@@ -1,0 +1,27 @@
+{
+  "name": "soulx-singer-dit",
+  "version": "0.1.0",
+  "description": "Node.js bindings for SoulX-Singer-DiT GGUF inference (no dequantization, via modified llama.cpp)",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "scripts": {
+    "install": "node scripts/postinstall.js || echo skip",
+    "test": "node test/smoke.js"
+  },
+  "optionalDependencies": {
+    "soulx-singer-dit-win32-x64-cpu": "^0.1.0",
+    "soulx-singer-dit-win32-x64-vulkan": "^0.1.0",
+    "soulx-singer-dit-win32-x64-cuda": "^0.1.0"
+  },
+  "files": ["index.js", "index.d.ts", "scripts/", "README.md", "docs/"],
+  "engines": { "node": ">=16" },
+  "keywords": ["soulx-singer", "dit", "gguf", "llama.cpp", "ggml", "vocoder", "singing-synthesis"],
+  "license": "MIT",
+  "author": "Henley04",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Henley04/soulx-singer-dit-node.git"
+  },
+  "bugs": { "url": "https://github.com/Henley04/soulx-singer-dit-node/issues" },
+  "homepage": "https://github.com/Henley04/soulx-singer-dit-node#readme"
+}
