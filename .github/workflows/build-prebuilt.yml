@@ -96,8 +96,10 @@ jobs:
           "NODE_INCLUDE_DIR=$incDir" | Out-File -FilePath $env:GITHUB_ENV -Append
           "NODE_LIB_DIR=$libDir" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Setup MSVC
+      - name: Setup MSVC (VS 2022)
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          vsversion: 2022
 
       # Vulkan backend: install the Vulkan SDK and export VULKAN_SDK so CMake
       # can find it in subsequent steps.
@@ -112,27 +114,37 @@ jobs:
         if: matrix.backend == 'vulkan'
         shell: pwsh
         run: |
-          # humbletim/install-vulkan-sdk may not persist VULKAN_SDK across
-          # steps, so find the installed SDK and export it explicitly.
-          $sdkDirs = Get-ChildItem "C:\VulkanSDK" -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending
-          if ($sdkDirs) {
-            $sdkPath = $sdkDirs[0].FullName
-            Write-Host "VULKAN_SDK=$sdkPath"
-            "VULKAN_SDK=$sdkPath" | Out-File -FilePath $env:GITHUB_ENV -Append
-            "$sdkPath\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
-          } else {
-            # Fallback: check VULKAN_SDK env var set by the installer
-            if ($env:VULKAN_SDK) {
-              Write-Host "VULKAN_SDK already set: $env:VULKAN_SDK"
-            } else {
-              Write-Error "Vulkan SDK not found in C:\VulkanSDK or env var"
-              exit 1
+          # humbletim/install-vulkan-sdk installs to the workspace dir, not
+          # C:\VulkanSDK.  Search multiple locations and persist VULKAN_SDK.
+          $candidates = @()
+          if ($env:VULKAN_SDK) { $candidates += $env:VULKAN_SDK }
+          $candidates += "$env:GITHUB_WORKSPACE\VULKAN_SDK"
+          $candidates += "C:\VulkanSDK"
+          $sdkPath = $null
+          foreach ($c in $candidates) {
+            Write-Host "Checking: $c"
+            if ((Test-Path $c) -and (Test-Path "$c\Include\vulkan\vulkan.h")) {
+              $sdkPath = $c
+              break
+            }
+            # Also check subdirectories (versioned)
+            if (Test-Path $c) {
+              $sub = Get-ChildItem $c -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+              if ($sub -and (Test-Path "$($sub.FullName)\Include\vulkan\vulkan.h")) {
+                $sdkPath = $sub.FullName
+                break
+              }
             }
           }
+          if (-not $sdkPath) {
+            Write-Error "Vulkan SDK not found in any expected location"
+            exit 1
+          }
+          Write-Host "VULKAN_SDK=$sdkPath"
+          "VULKAN_SDK=$sdkPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$sdkPath\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
-      # CUDA backend: 12.4.0 is compatible with MSVC 14.4x.  The
-      # -allow-unsupported-compiler flag in cmake_opts bypasses host_config.h
-      # version checks for newer MSVC if needed.
+      # CUDA backend: 12.4.0 is compatible with VS 2022's MSVC 14.4x.
       - name: Setup CUDA
         if: matrix.backend == 'cuda'
         uses: Jimver/cuda-toolkit@v0.2.15
