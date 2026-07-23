@@ -16,29 +16,82 @@ concurrency:
   group: build-prebuilt-${{ github.ref }}
   cancel-in-progress: true
 
+# ---------------------------------------------------------------------------
+# Build matrix.
+#
+# Distribution goal: a SINGLE .node per (OS, arch) carries the CPU backend
+# (always) plus whichever GPU backends are enabled, and the C++ runtime picks
+# the fastest path at load time via ggml_backend_dev_count() (see
+# pick_backend() in infer.cpp). GGML_NATIVE is forced OFF in CMakeLists.txt so
+# no -march=native leaks into the binary; AMX/AVX512/AVX2 (x86) and
+# NEON/i8mm/SVE (ARM) kernels are compiled in as separate objects and selected
+# at runtime via ggml_cpu_has_*(). The same .node therefore runs on any CPU of
+# that arch family without SIGILL.
+#
+# GPU backends are still split into separate .node files (cpu/vulkan/cuda) on
+# Windows for now, because the Windows toolchain (CUDA toolkit, Vulkan SDK)
+# makes a single all-backend binary large and fragile. Linux/macOS ship a
+# CPU-only runtime-dispatched .node.
+# ---------------------------------------------------------------------------
 jobs:
   build:
-    name: Build ${{ matrix.backend }}
+    name: Build ${{ matrix.platform_key }}-${{ matrix.backend }}
     runs-on: ${{ matrix.runs_on }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - backend: cpu
+          # ---- Windows x64 ----
+          - os: windows
+            backend: cpu
             runs_on: windows-latest
             cmake_opts: '-DGGML_CPU=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF'
             artifact_name: cpu.node
-          - backend: vulkan
+            platform_key: win32-x64
+          - os: windows
+            backend: vulkan
             runs_on: windows-latest
             cmake_opts: '-DGGML_CPU=ON -DGGML_VULKAN=ON -DGGML_CUDA=OFF'
             artifact_name: vulkan.node
+            platform_key: win32-x64
           # CUDA needs VS 2022 (MSVC 14.4x); the default windows-latest
           # runner is now windows-2025-vs2026 (MSVC 14.51) whose cudafe++
           # crashes with every available CUDA version.
-          - backend: cuda
+          - os: windows
+            backend: cuda
             runs_on: windows-2022
             cmake_opts: '-DGGML_CPU=ON -DGGML_VULKAN=OFF -DGGML_CUDA=ON'
             artifact_name: cuda.node
+            platform_key: win32-x64
+          # ---- Linux x64 CPU (runtime AMX/AVX512/AVX2 dispatch) ----
+          - os: linux
+            backend: cpu
+            runs_on: ubuntu-latest
+            cmake_opts: '-DGGML_CPU=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF'
+            artifact_name: cpu.node
+            platform_key: linux-x64
+          # ---- Linux arm64 CPU (runtime NEON/i8mm/SVE dispatch) ----
+          # Uses GitHub's free native ARM64 runner for public repos.
+          - os: linux
+            backend: cpu
+            runs_on: ubuntu-24.04-arm
+            cmake_opts: '-DGGML_CPU=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF'
+            artifact_name: cpu.node
+            platform_key: linux-arm64
+          # ---- macOS arm64 (Apple Silicon, Accelerate) ----
+          - os: macos
+            backend: cpu
+            runs_on: macos-14
+            cmake_opts: '-DGGML_CPU=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_ACCELERATE=ON'
+            artifact_name: cpu.node
+            platform_key: darwin-arm64
+          # ---- macOS x64 (Intel, Accelerate) ----
+          - os: macos
+            backend: cpu
+            runs_on: macos-13
+            cmake_opts: '-DGGML_CPU=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_ACCELERATE=ON'
+            artifact_name: cpu.node
+            platform_key: darwin-x64
 
     steps:
       - name: Checkout
@@ -49,7 +102,16 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install Ninja
+      - name: Install Ninja (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build ccache
+
+      - name: Install Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja ccache
+
+      - name: Install Ninja (Windows)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           choco install ninja -y --no-progress
@@ -60,14 +122,15 @@ jobs:
         run: npm install node-addon-api
 
       - name: Clone llama.cpp
-        run: |
-          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git vendor/llama.cpp
+        run: git clone --depth 1 https://github.com/ggml-org/llama.cpp.git vendor/llama.cpp
 
       # Download Node.js development headers AND node.lib (import library)
       # directly from nodejs.org.  On Windows the linker needs node.lib to
       # resolve napi_* symbols — they are NOT resolved from the host process
-      # at link time like on Linux/macOS.
-      - name: Download Node.js headers & node.lib
+      # at link time like on Linux/macOS.  Linux/macOS rely on the CMake
+      # auto-detection of headers from the setup-node distribution.
+      - name: Download Node.js headers & node.lib (Windows)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $nodeVersion = (node -v).TrimStart('v')
@@ -102,7 +165,8 @@ jobs:
           "NODE_INCLUDE_DIR=$incDir" | Out-File -FilePath $env:GITHUB_ENV -Append
           "NODE_LIB_DIR=$libDir" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Setup MSVC
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
       # Vulkan backend: download the full Vulkan SDK installer (~175 MB)
@@ -210,46 +274,51 @@ jobs:
           Write-Host "SPIRV_HEADERS_DIR=$cmakeDir"
 
       - name: Configure CMake
-        shell: pwsh
+        shell: bash
         run: |
-          $extraArgs = @()
-          if ("${{ matrix.backend }}" -eq "vulkan" -and $env:SPIRV_HEADERS_DIR) {
-            $extraArgs += "-DSPIRV-Headers_DIR=$env:SPIRV_HEADERS_DIR"
-          }
-          cmake -B build -G "Ninja" `
-            -DCMAKE_BUILD_TYPE=Release `
-            ${{ matrix.cmake_opts }} `
-            -DNODE_INCLUDE_DIR="$env:NODE_INCLUDE_DIR" `
-            @extraArgs
+          set -e
+          extra_args=""
+          if [ "${{ matrix.backend }}" = "vulkan" ] && [ -n "$SPIRV_HEADERS_DIR" ]; then
+            extra_args="-DSPIRV-Headers_DIR=$SPIRV_HEADERS_DIR"
+          fi
+          # On Windows, NODE_INCLUDE_DIR/NODE_LIB_DIR are exported to the env
+          # by the "Download Node.js headers" step and picked up automatically
+          # by CMakeLists.txt. On Linux/macOS the headers are auto-detected
+          # from the setup-node distribution.
+          cmake -B build -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=Release \
+            ${{ matrix.cmake_opts }} \
+            $extra_args
 
       - name: Build
         run: cmake --build build --config Release --parallel
 
       - name: Rename .node file
-        shell: pwsh
+        shell: bash
         run: |
-          $src = "build/soulx_singer_dit.node"
-          if (-not (Test-Path $src)) { $src = "build/Release/soulx_singer_dit.node" }
-          if (-not (Test-Path $src)) {
-            Write-Error "Build output not found"
-            Get-ChildItem -Recurse build -Filter "*.node" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+          set -e
+          src="build/soulx_singer_dit.node"
+          if [ ! -f "$src" ]; then src="build/Release/soulx_singer_dit.node"; fi
+          if [ ! -f "$src" ]; then
+            echo "Build output not found"
+            find build -name '*.node' 2>/dev/null || true
             exit 1
-          }
-          $dest = "packages/win32-x64-${{ matrix.backend }}/${{ matrix.backend }}.node"
-          New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
-          Copy-Item $src $dest -Force
-          Write-Host "Produced: $dest"
+          fi
+          dest="packages/${{ matrix.platform_key }}-${{ matrix.backend }}/${{ matrix.artifact_name }}"
+          mkdir -p "$(dirname "$dest")"
+          cp "$src" "$dest"
+          echo "Produced: $dest"
 
       - name: Verify .node loads
-        shell: pwsh
+        shell: bash
         run: |
-          node -e "try { require('./packages/win32-x64-${{ matrix.backend }}/${{ matrix.backend }}.node'); console.log('LOAD OK'); } catch(e) { console.error('LOAD FAIL:', e.message); exit(1); }"
+          node -e "try { require('./packages/${{ matrix.platform_key }}-${{ matrix.backend }}/${{ matrix.artifact_name }}'); console.log('LOAD OK'); } catch(e) { console.error('LOAD FAIL:', e.message); exit(1); }"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.backend }}-node
-          path: packages/win32-x64-${{ matrix.backend }}/${{ matrix.backend }}.node
+          name: ${{ matrix.platform_key }}-${{ matrix.backend }}-node
+          path: packages/${{ matrix.platform_key }}-${{ matrix.backend }}/${{ matrix.artifact_name }}
           retention-days: 30
           if-no-files-found: error
 
@@ -270,20 +339,35 @@ jobs:
 
       - name: Place .node files in subpackages
         run: |
-          mkdir -p packages/win32-x64-cpu packages/win32-x64-vulkan packages/win32-x64-cuda
-          # Remove any stale .node files from the repo checkout so we don't
+          set -e
+          # Every (platform_key, backend) combo the build matrix can produce.
+          combos="
+            win32-x64-cpu win32-x64-vulkan win32-x64-cuda
+            linux-x64-cpu linux-arm64-cpu
+            darwin-arm64-cpu darwin-x64-cpu
+          "
+          # Remove stale .node files from the repo checkout so we never
           # accidentally publish old/placeholder binaries.
-          rm -f packages/win32-x64-*/*.node
-          for backend in cpu vulkan cuda; do
-            src="artifacts/${backend}-node/${backend}.node"
+          rm -f packages/*/*.node 2>/dev/null || true
+          for combo in $combos; do
+            # combo is e.g. "win32-x64-cpu"; split into platform_key and backend.
+            backend="${combo##*-}"
+            platform_key="${combo%-$backend}"
+            node_file="cpu.node"
+            [ "$backend" = "vulkan" ] && node_file="vulkan.node"
+            [ "$backend" = "cuda" ]   && node_file="cuda.node"
+            src="artifacts/${combo}-node/${node_file}"
+            dst_dir="packages/${combo}"
+            mkdir -p "$dst_dir"
             if [ -f "$src" ]; then
-              cp "$src" "packages/win32-x64-${backend}/"
-              echo "Collected: ${backend}"
+              cp "$src" "$dst_dir/"
+              echo "Collected: ${combo}"
             else
-              echo "MISSING: ${backend} (will skip publish for this backend)"
+              echo "MISSING: ${combo} (will skip publish for this combo)"
             fi
           done
-          ls -la packages/win32-x64-*/
+          echo "--- packages tree ---"
+          ls -la packages/*/
 
       - name: Upload complete packages
         uses: actions/upload-artifact@v7

@@ -11,17 +11,42 @@
   "optionalDependencies": {
     "soulx-singer-dit-win32-x64-cpu": "^0.1.1",
     "soulx-singer-dit-win32-x64-vulkan": "^0.1.1",
-    "soulx-singer-dit-win32-x64-cuda": "^0.1.1"
+    "soulx-singer-dit-win32-x64-cuda": "^0.1.1",
+    "soulx-singer-dit-linux-x64-cpu": "^0.1.1",
+    "soulx-singer-dit-linux-arm64-cpu": "^0.1.1",
+    "soulx-singer-dit-darwin-arm64-cpu": "^0.1.1",
+    "soulx-singer-dit-darwin-x64-cpu": "^0.1.1"
   },
-  "files": ["index.js", "index.d.ts", "scripts/", "README.md", "docs/"],
-  "engines": { "node": ">=16" },
-  "keywords": ["soulx-singer", "dit", "gguf", "llama.cpp", "ggml", "vocoder", "singing-synthesis"],
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "scripts/",
+    "README.md",
+    "docs/"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "keywords": [
+    "soulx-singer",
+    "dit",
+    "gguf",
+    "llama.cpp",
+    "ggml",
+    "vocoder",
+    "singing-synthesis"
+  ],
   "license": "MIT",
   "author": "Henley04",
   "repository": {
     "type": "git",
     "url": "https://github.com/Henley04/soulx-singer-dit-node.git"
   },
-  "bugs": { "url": "https://github.com/Henley04/soulx-singer-dit-node/issues" },
-  "homepage": "https://github.com/Henley04/soulx-singer-dit-node#readme"
+  "bugs": {
+    "url": "https://github.com/Henley04/soulx-singer-dit-node/issues"
+  },
+  "homepage": "https://github.com/Henley04/soulx-singer-dit-node#readme",
+  "dependencies": {
+    "node-addon-api": "^8.9.0"
+  }
 }
