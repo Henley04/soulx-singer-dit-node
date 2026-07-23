@@ -196,9 +196,20 @@ set(GGML_BUILD_EXAMPLES  OFF CACHE BOOL "" FORCE)
 add_subdirectory(${LLAMA_CPP_DIR} llama_cpp_build EXCLUDE_FROM_ALL)
 
 # ---------------------------------------------------------------------------
-# Our native addon — a single .node shared library.
+# Our native addon — a single .node loadable module.
+#
+# MODULE (not SHARED) is the correct library type for a Node native addon:
+#   - macOS: produces a -bundle (MACH-O MH_BUNDLE) which the Node process
+#     dlopen()s. SHARED would produce a -dynamiclib that the macOS linker
+#     refuses to leave with unresolved _napi_* symbols at link time. MODULE
+#     + the -undefined dynamic_lookup flag below lets those symbols resolve
+#     from the host Node process at runtime, matching Linux/Windows behaviour.
+#   - Linux: MODULE is equivalent to SHARED for our purposes (the .node is
+#     dlopen'd by Node), and CMake leaves undefined symbols by default.
+#   - Windows: MODULE still produces a .dll; the explicit node.lib link
+#     below resolves the N-API symbols at link time as before.
 # ---------------------------------------------------------------------------
-add_library(soulx_singer_dit SHARED
+add_library(soulx_singer_dit MODULE
     src/binding.cc
     src/infer.cpp
 )
@@ -231,6 +242,15 @@ endif()
 
 # Link ggml (pulls in ggml-base + whichever backends are enabled).
 target_link_libraries(soulx_singer_dit PRIVATE ggml)
+
+# macOS: N-API symbols (_napi_*) are provided by the host Node process at
+# runtime, but the macOS linker rejects unresolved symbols by default.
+# -undefined dynamic_lookup defers their resolution to dlopen() time, so the
+# .node bundle loads cleanly when Node requires() it. Linux leaves undefined
+# symbols alone already; Windows resolves them via node.lib below.
+if(APPLE)
+    target_link_options(soulx_singer_dit PRIVATE -undefined dynamic_lookup)
+endif()
 
 # On Windows, N-API symbols do NOT resolve from the host node process at
 # link time — unlike Linux/macOS, the Windows linker requires an explicit
