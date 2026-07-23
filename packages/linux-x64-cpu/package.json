@@ -1,6 +1,6 @@
 {
   "name": "soulx-singer-dit-linux-x64-cpu",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Prebuilt CPU backend for soulx-singer-dit (Linux x64, runtime AMX/AVX512/AVX2 dispatch)",
   "main": "index.js",
   "types": "index.d.ts",

@@ -1,6 +1,6 @@
 {
   "name": "soulx-singer-dit-darwin-arm64-cpu",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Prebuilt CPU backend for soulx-singer-dit (macOS arm64 / Apple Silicon, Accelerate)",
   "main": "index.js",
   "types": "index.d.ts",
