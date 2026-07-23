@@ -1,0 +1,142 @@
+name: Benchmark & Regression
+
+on:
+  # Manual trigger from the Actions tab. NOT wired to pull_request so it
+  # never blocks a merge — perf regression gating needs a model file and
+  # dedicated hardware, which PR CI cannot assume.
+  workflow_dispatch:
+    inputs:
+      model_url:
+        description: 'URL to a SoulX-Singer-DiT GGUF model (optional; overrides the MODEL_URL secret)'
+        required: false
+        type: string
+  # Weekly Sunday run on the default branch to catch silent regressions.
+  schedule:
+    - cron: '0 6 * * 0'
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+# ---------------------------------------------------------------------------
+# Regression / benchmark suite (plan item #18).
+#
+# Builds the .node with the same distribution-safe flags as the prebuilt
+# pipeline (GGML_NATIVE=OFF, AMX compiled in, runtime-gated), then:
+#   1. Smoke-tests the build (require + getVersion).
+#   2. If a model URL is supplied (via the dispatch input or the MODEL_URL
+#      secret), downloads it and runs a deterministic forward pass + reverse
+#      diffusion, recording per-step latency and total wall time. The fixed
+#      seed makes the run reproducible across machines, so the timings can be
+#      diffed week-over-week to spot perf regressions.
+#   3. Uploads the JSON benchmark report as an artifact.
+#
+# The C++ side already logs the resolved backend, thread count, NUMA state,
+# and AMX availability at Model::load time, so the report captures which
+# runtime path was exercised.
+# ---------------------------------------------------------------------------
+jobs:
+  benchmark-linux-x64:
+    name: Benchmark (linux-x64-cpu)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build ccache
+          npm install node-addon-api
+
+      - name: Clone llama.cpp
+        run: git clone --depth 1 https://github.com/ggml-org/llama.cpp.git vendor/llama.cpp
+
+      - name: Configure CMake (CPU, runtime dispatch)
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CPU=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Smoke test (.node loads & exports)
+        run: |
+          node -e " \
+            const m = require('./build/soulx_singer_dit.node'); \
+            if (typeof m.Model !== 'function') throw new Error('Model not exported'); \
+            console.log('SMOKE OK: version=' + m.getVersion());"
+
+      - name: Resolve model URL
+        id: model
+        run: |
+          url="${{ inputs.model_url }}"
+          if [ -z "$url" ]; then url="${{ secrets.MODEL_URL }}"; fi
+          if [ -n "$url" ]; then
+            echo "have_model=true" >> "$GITHUB_OUTPUT"
+            echo "model_url=$url" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_model=false" >> "$GITHUB_OUTPUT"
+            echo "No model URL provided (set MODEL_URL secret or pass model_url input); skipping timed run."
+          fi
+
+      - name: Download model (if available)
+        if: steps.model.outputs.have_model == 'true'
+        run: |
+          curl -L --retry 3 -o model.gguf "${{ steps.model.outputs.model_url }}"
+          ls -la model.gguf
+
+      - name: Run timed forward + reverse diffusion
+        if: steps.model.outputs.have_model == 'true'
+        run: |
+          node -e "
+            const { Model } = require('./build/soulx_singer_dit.node');
+            const MEL_DIM = 128, HIDDEN = 1024, T = 64;
+            const m = new Model('./model.gguf', { backend: 'cpu' });
+            // Deterministic inputs (fixed seed) so timing is comparable run-to-run.
+            const x = new Float32Array(MEL_DIM * T).fill(0).map((_, i) => Math.sin(i * 0.01));
+            const cond = new Float32Array(HIDDEN * T).fill(0).map((_, i) => Math.cos(i * 0.005));
+            // Warm up (first call pays allocation / NUMA setup cost).
+            m.forward({ x, cond, t: 0.5, T });
+            // Timed forward pass.
+            const t0 = process.hrtime.bigint();
+            const v = m.forward({ x, cond, t: 0.5, T });
+            const fwd_ms = Number(process.hrtime.bigint() - t0) / 1e6;
+            // Timed reverse diffusion (fewer steps for CI speed).
+            const promptLen = 16, targetLen = 16, nSteps = 4;
+            const promptMel = new Float32Array(MEL_DIM * promptLen).fill(0.1);
+            const condFull = new Float32Array(HIDDEN * (promptLen + targetLen)).fill(0.1);
+            const z = new Float32Array(MEL_DIM * targetLen).fill(0).map((_, i) => Math.sin(i));
+            const t1 = process.hrtime.bigint();
+            const mel = m.reverseDiffusion({ promptMel, cond: condFull, z, promptLen, targetLen, nSteps, seed: 12345 });
+            const rev_ms = Number(process.hrtime.bigint() - t1) / 1e6;
+            const report = {
+              platform: 'linux-x64-cpu',
+              node: process.version,
+              forward_ms: +fwd_ms.toFixed(2),
+              reverse_ms: +rev_ms.toFixed(2),
+              forward_out_len: v.length,
+              reverse_out_len: mel.length,
+              timestamp: new Date().toISOString(),
+            };
+            require('fs').writeFileSync('benchmark-report.json', JSON.stringify(report, null, 2));
+            console.log(JSON.stringify(report, null, 2));
+            m.release();
+          "
+
+      - name: Upload benchmark report
+        if: steps.model.outputs.have_model == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-report-linux-x64
+          path: benchmark-report.json
+          retention-days: 90
+          if-no-files-found: warn

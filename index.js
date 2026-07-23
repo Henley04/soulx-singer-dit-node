@@ -28,24 +28,34 @@ const VALID_BACKENDS = ['cpu', 'vulkan', 'cuda'];
 // the dlopen cost twice for the same .node file.
 const nativeCache = new Map();
 
-// Per-platform mapping of backend -> subpackage name. Currently only Windows
-// x64 ships prebuilt binaries; other platforms are listed here so the error
-// message can be precise about what is *not* supported yet.
+// Per-platform mapping of backend -> subpackage name.
 //
-// Keys are `${platform}-${arch}` strings. A null entry means the platform is
-// recognized but has no prebuilt backend shipped.
+// Each (platform, arch) ships a CPU backend subpackage whose .node was built
+// with GGML_NATIVE=OFF so it runtime-dispatches to the best ISA (AMX/AVX512/
+// AVX2 on x86, NEON/i8mm/SVE on ARM) via ggml_cpu_has_*() — the SAME binary
+// runs on any CPU of that arch family. Windows x64 additionally ships Vulkan
+// and CUDA subpackages. Keys are `${platform}-${arch}` strings; a null entry
+// means the platform is recognized but has no prebuilt backend shipped.
 const PLATFORM_BACKENDS = {
   'win32-x64': {
     cpu: 'soulx-singer-dit-win32-x64-cpu',
     vulkan: 'soulx-singer-dit-win32-x64-vulkan',
     cuda: 'soulx-singer-dit-win32-x64-cuda',
   },
-  // No prebuilts shipped for the following (yet); listed explicitly so the
-  // error message can mention them rather than emit a generic "unsupported".
-  'darwin-x64': null,
-  'darwin-arm64': null,
-  'linux-x64': null,
-  'linux-arm64': null,
+  'linux-x64': {
+    cpu: 'soulx-singer-dit-linux-x64-cpu',
+  },
+  'linux-arm64': {
+    cpu: 'soulx-singer-dit-linux-arm64-cpu',
+  },
+  'darwin-arm64': {
+    cpu: 'soulx-singer-dit-darwin-arm64-cpu',
+  },
+  'darwin-x64': {
+    cpu: 'soulx-singer-dit-darwin-x64-cpu',
+  },
+  // No prebuilts shipped for the following; listed explicitly so the error
+  // message can mention them rather than emit a generic "unsupported".
   'linux-arm': null,
 };
 
@@ -106,7 +116,8 @@ function loadNative(backend) {
     throw new Error(
       'soulx-singer-dit has no prebuilt binary for platform ' +
         JSON.stringify(key) + '.\n' +
-        'Supported prebuilt platforms: win32-x64.\n' +
+        'Supported prebuilt platforms: win32-x64, linux-x64, linux-arm64, ' +
+        'darwin-arm64, darwin-x64.\n' +
         'To build from source, see the repository README.'
     );
   }
@@ -123,9 +134,10 @@ function loadNative(backend) {
   let nativeModule;
   try {
     // The subpackage's index.js in turn requires the prebuilt .node file.
-    // The require path follows the documented convention:
-    //   require('soulx-singer-dit-win32-x64-' + backend)
-    nativeModule = require('soulx-singer-dit-win32-x64-' + backend);
+    // Use the platform-specific subpackage name resolved above (e.g.
+    // 'soulx-singer-dit-linux-x64-cpu') so the correct binary is loaded on
+    // every supported platform.
+    nativeModule = require(subpackageName);
   } catch (err) {
     throw new Error(
       'soulx-singer-dit: failed to load backend ' +

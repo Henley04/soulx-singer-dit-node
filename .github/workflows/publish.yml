@@ -87,18 +87,29 @@ jobs:
           mkdir -p packages-tmp
           unzip prebuilt.zip -d packages-tmp
           # Remove any stale .node files from the repo checkout first.
-          rm -f packages/win32-x64-*/*.node
+          rm -f packages/*/*.node 2>/dev/null || true
           # Copy whichever .node files exist into the subpackage dirs.
-          for backend in cpu vulkan cuda; do
-            src="packages-tmp/win32-x64-${backend}/${backend}.node"
+          # Each combo dir is <platform_key>-<backend> holding <backend>.node.
+          combos="
+            win32-x64-cpu win32-x64-vulkan win32-x64-cuda
+            linux-x64-cpu linux-arm64-cpu
+            darwin-arm64-cpu darwin-x64-cpu
+          "
+          for combo in $combos; do
+            backend="${combo##*-}"
+            node_file="cpu.node"
+            [ "$backend" = "vulkan" ] && node_file="vulkan.node"
+            [ "$backend" = "cuda" ]   && node_file="cuda.node"
+            src="packages-tmp/${combo}/${node_file}"
             if [ -f "$src" ]; then
-              cp "$src" "packages/win32-x64-${backend}/"
-              echo "Present: ${backend}"
+              mkdir -p "packages/${combo}"
+              cp "$src" "packages/${combo}/"
+              echo "Present: ${combo}"
             else
-              echo "Absent:  ${backend} (will skip its publish step)"
+              echo "Absent:  ${combo} (will skip its publish step)"
             fi
           done
-          ls -la packages/win32-x64-*/
+          ls -la packages/*/
 
       - name: Read version from package.json
         id: version
@@ -128,9 +139,41 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      - name: Publish Linux x64 CPU subpackage
+        if: hashFiles('packages/linux-x64-cpu/cpu.node') != ''
+        run: |
+          cd packages/linux-x64-cpu
+          npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish Linux arm64 CPU subpackage
+        if: hashFiles('packages/linux-arm64-cpu/cpu.node') != ''
+        run: |
+          cd packages/linux-arm64-cpu
+          npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish macOS arm64 CPU subpackage
+        if: hashFiles('packages/darwin-arm64-cpu/cpu.node') != ''
+        run: |
+          cd packages/darwin-arm64-cpu
+          npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish macOS x64 CPU subpackage
+        if: hashFiles('packages/darwin-x64-cpu/cpu.node') != ''
+        run: |
+          cd packages/darwin-x64-cpu
+          npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
       - name: Publish main package
         # Only publish the umbrella package if at least one backend built.
-        if: hashFiles('packages/win32-x64-cpu/cpu.node') != '' || hashFiles('packages/win32-x64-vulkan/vulkan.node') != '' || hashFiles('packages/win32-x64-cuda/cuda.node') != ''
+        if: hashFiles('packages/win32-x64-cpu/cpu.node') != '' || hashFiles('packages/win32-x64-vulkan/vulkan.node') != '' || hashFiles('packages/win32-x64-cuda/cuda.node') != '' || hashFiles('packages/linux-x64-cpu/cpu.node') != '' || hashFiles('packages/linux-arm64-cpu/cpu.node') != '' || hashFiles('packages/darwin-arm64-cpu/cpu.node') != '' || hashFiles('packages/darwin-x64-cpu/cpu.node') != ''
         run: |
           npm publish --provenance --access public
         env:

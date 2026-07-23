@@ -23,10 +23,13 @@
 //
 //   m.release();   // free native resources eagerly (optional; GC also works)
 //
-// The `backend` option is informational only at the C++ layer — the JS layer
-// is responsible for loading the right .node file per backend. The C++ binding
-// always loads the GGUF via mmap and runs inference through ggml_mul_mat on
-// quantized weights (no dequantization).
+// The `backend` option is forwarded to Model::load() so the C++ runtime can
+// auto-select the best ggml backend compiled into this .node (CPU always;
+// CUDA/HIP/Metal/Vulkan when enabled at build time). Priority is dedicated
+// GPU > Vulkan > CPU. A single .node thus distributes to any host and picks
+// the fastest path at runtime — no per-machine rebuild needed. Weights are
+// mmap'd (CPU) or uploaded to a backend buffer (GPU) and all matmuls run on
+// packed quantized weights via ggml_mul_mat (no dequantization).
 
 #include <napi.h>
 
@@ -135,8 +138,13 @@ public:
     }
 
     // Constructor: new Model(path: string, options?: { backend?: string })
-    // The `backend` option is accepted but ignored at the C++ layer (it is
-    // used by the JS layer to pick the correct .node file).
+    //
+    // The `backend` option is forwarded to Model::load() so the C++ runtime
+    // can pick the best ggml backend compiled into this .node ("" / "auto" =>
+    // auto-select; "gpu" => require a GPU, fall back to CPU; "cpu" => force
+    // CPU). With runtime dispatch a single .node can carry CPU + Vulkan +
+    // CUDA and pick the fastest at load time, so the JS-side subpackage
+    // selection and this hint are complementary, not redundant.
     ModelWrapper(const Napi::CallbackInfo& info)
         : Napi::ObjectWrap<ModelWrapper>(info) {
         Napi::Env env = info.Env();
@@ -148,17 +156,20 @@ public:
         }
         std::string path = info[0].As<Napi::String>().Utf8Value();
 
-        // Optional options object — validate but otherwise ignored.
+        std::string backend_pref;  // "" => auto-select
         if (info.Length() >= 2 && !info[1].IsUndefined() && !info[1].IsNull()) {
             if (!info[1].IsObject()) {
                 Napi::TypeError::New(env, "options must be an object")
                     .ThrowAsJavaScriptException();
                 return;
             }
-            // `backend` field (if present) is informational only.
+            Napi::Object opts = info[1].As<Napi::Object>();
+            if (opts.Has("backend") && opts.Get("backend").IsString()) {
+                backend_pref = opts.Get("backend").As<Napi::String>().Utf8Value();
+            }
         }
 
-        if (!model_.load(path)) {
+        if (!model_.load(path, backend_pref)) {
             Napi::Error::New(env, "Failed to load GGUF model: " + path)
                 .ThrowAsJavaScriptException();
             return;

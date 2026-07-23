@@ -12,6 +12,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 
 #include <cmath>
@@ -59,6 +60,15 @@ struct RNG {
 // ---------------------------------------------------------------------------
 // mmap'd GGUF model. Quantized weight blobs stay in their packed form; tensor
 // ->data pointers are set directly into the mmap region.
+//
+// Runtime backend selection:
+//   On load, pick_backend() enumerates the ggml backend devices compiled into
+//   this .node (CPU always; CUDA/HIP/Metal/Vulkan if enabled at build time)
+//   and selects the best one. When a GPU backend is chosen, weights are
+//   uploaded into a backend buffer (VRAM) and graph compute runs on the GPU.
+//   When CPU is chosen, weights stay mmap'd (zero-copy) and graph compute runs
+//   on the host. The same source/build serves every platform; the C++ layer
+//   auto-selects the fastest path at runtime.
 // ---------------------------------------------------------------------------
 struct Model {
     std::string path;
@@ -71,7 +81,18 @@ struct Model {
     HANDLE file_mapping  = nullptr;  // file mapping handle for mmap cleanup
 #endif
 
-    bool load(const std::string & path_);
+    // ---- Runtime backend -------------------------------------------------
+    // For GPU backends: backend handle + buffer type used to upload weights
+    // and allocate per-call intermediates. For CPU: backend is null and the
+    // mmap zero-copy path is used (no backend buffer for weights).
+    ggml_backend_t              backend     = nullptr;
+    ggml_backend_buffer_type_t  buft        = nullptr;
+    ggml_backend_buffer_t       weight_buf  = nullptr;
+    bool                        use_gpu     = false;
+    int                         n_threads   = 0;   // resolved at load time
+    std::string                 backend_name;
+
+    bool load(const std::string & path_, const std::string & backend_pref = "");
     void unload();
 
     ggml_tensor * get(const std::string & name) const {
@@ -86,6 +107,24 @@ struct Model {
         return t;
     }
 };
+
+// ---------------------------------------------------------------------------
+// Runtime helpers (implemented in infer.cpp).
+// ---------------------------------------------------------------------------
+
+// Decide the worker thread count for CPU graph compute. Uses
+// std::thread::hardware_concurrency(), caps to the cgroup v2/v1 CPU quota
+// (important in containers), and (best-effort on Linux) caps to the physical
+// core count to avoid SMT oversubscription. Never returns less than 1.
+int runtime_thread_count();
+
+// Pick the best available ggml backend device. Priority: dedicated GPU
+// (CUDA/HIP/Metal/SYCL) > Vulkan > CPU. `pref` may be "cpu" to force the CPU
+// path, "gpu" to require a GPU (falls back to CPU if none), or "" / "auto"
+// for automatic selection. Sets `out_is_gpu` accordingly and returns the
+// initialized backend (caller frees via ggml_backend_free).
+ggml_backend_t pick_backend(const std::string & pref, bool & out_is_gpu,
+                            std::string & out_name);
 
 // ---------------------------------------------------------------------------
 // Run a single DiT forward pass.

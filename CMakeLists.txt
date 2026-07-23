@@ -25,16 +25,73 @@ endif()
 
 # ---------------------------------------------------------------------------
 # Backend selection options (passed through to llama.cpp's ggml CMake).
-# Exactly one backend is typically enabled per build; CI produces one .node
-# per backend and the JS layer loads the right one.
+#
+# Distribution model: a single .node contains the CPU backend (always) plus
+# whichever GPU backends are enabled here. ggml's backends are plugins and
+# happily coexist in one binary; the C++ runtime enumerates them with
+# ggml_backend_dev_count() and picks the best one (see pick_backend() in
+# infer.cpp). So the SAME source produces:
+#   - a CPU-only .node          (GGML_CPU=ON only)
+#   - a CPU+CUDA+Vulkan .node   (all three ON)  -> "single artifact" per OS
+#   - a CPU+Metal .node         (macOS)
+#
+# CRITICAL: GGML_NATIVE is forced OFF below so the compiler does NOT emit
+# -march=native. With -march=native the binary inherits the build machine's
+# ISA and SIGILLs on older CPUs. Instead we compile a baseline ISA (SSE2/AVX
+# on x86, NEON on ARM) plus the AMX/AVX512/AVX2 kernels as separate object
+# files; ggml-cpu's mul_mat dispatch picks the right kernel at runtime via
+# ggml_cpu_has_*(). AMX kernels are compiled in (GGML_AMX_*) but only
+# executed when ggml_cpu_has_amx_int8() is true at runtime, so they never
+# SIGILL on non-AMX hardware.
 # ---------------------------------------------------------------------------
 option(GGML_CPU        "Enable ggml CPU backend"            ON)
 option(GGML_VULKAN     "Enable ggml Vulkan backend"         OFF)
 option(GGML_CUDA       "Enable ggml CUDA backend"           OFF)
+option(GGML_HIP        "Enable ggml HIP backend (AMD)"      OFF)
+option(GGML_SYCL       "Enable ggml SYCL backend (Intel)"   OFF)
 option(GGML_METAL      "Enable ggml Metal backend (macOS)"  OFF)
 option(GGML_ACCELERATE "Enable Accelerate framework (macOS)" OFF)
 option(GGML_BLAS       "Use BLAS"                           OFF)
 option(GGML_OPENMP     "Use OpenMP"                         ON)
+
+# Force the distribution-safe CPU configuration. These are ggml cache
+# variables set BEFORE add_subdirectory(llama.cpp) so llama.cpp's option()
+# calls honour them.
+set(GGML_NATIVE OFF CACHE BOOL "Disable -march=native; rely on ggml runtime dispatch" FORCE)
+set(GGML_LTO    OFF  CACHE BOOL "Disable LTO for reproducible dispatch" FORCE)
+
+# AMX: compile the kernels in (x86 only) so they are available when the host
+# CPU supports them. ggml-cpu guards execution with ggml_cpu_has_amx_int8().
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|amd64|i386|i686)")
+    set(GGML_AMX_TILE ON  CACHE BOOL "Compile AMX tile kernels (runtime-gated)" FORCE)
+    set(GGML_AMX_INT8 ON  CACHE BOOL "Compile AMX int8 kernels (runtime-gated)" FORCE)
+    set(GGML_AMX_BF16 ON  CACHE BOOL "Compile AMX bf16 kernels (runtime-gated)" FORCE)
+else()
+    set(GGML_AMX_TILE OFF CACHE BOOL "" FORCE)
+    set(GGML_AMX_INT8 OFF CACHE BOOL "" FORCE)
+    set(GGML_AMX_BF16 OFF CACHE BOOL "" FORCE)
+endif()
+
+# NUMA awareness on Linux: ggml-cpu reads the NUMA topology at backend init
+# and pins worker threads per-socket. Avoids cross-socket memory traffic that
+# halves AMX/AVX512 throughput on multi-socket boxes.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(GGML_NUMA ON CACHE BOOL "Enable NUMA awareness" FORCE)
+endif()
+
+# ARM: expose NEON/i8mm/SVE capable baseline for aarch64 (Graviton, Apple
+# Silicon, Snapdragon). ggml-cpu runtime-dispatches among NEON/i8mm/SVE.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64|arm64|ARM64)")
+    if(NOT DEFINED GGML_ARM_ARCH)
+        set(GGML_ARM_ARCH "armv8.2-a+fp16+dotprod+i8mm" CACHE STRING "ARM baseline ISA" FORCE)
+    endif()
+endif()
+
+# CUDA graphs: capture the per-step graph once and replay it, eliminating
+# per-kernel launch overhead (22 layers x dozens of kernels per step).
+if(GGML_CUDA)
+    set(GGML_CUDA_USE_GRAPHS ON CACHE BOOL "Use CUDA graph capture" FORCE)
+endif()
 
 # ---------------------------------------------------------------------------
 # Locate llama.cpp source (expected at vendor/llama.cpp).
@@ -74,9 +131,13 @@ elseif(NOT DEFINED NODE_INCLUDE_DIRS)
     find_program(NODE_EXECUTABLE node)
     if(NODE_EXECUTABLE)
         # Ask node where its headers live for the current installation.
+        # process.execPath is <prefix>/bin/node, so the headers ship at
+        # <prefix>/include/node (NOT <prefix>/bin/include/node). Go up one
+        # dir from bin/ to reach the prefix. This matters for nvm and for
+        # actions/setup-node distributions on Linux/macOS runners.
         execute_process(
             COMMAND ${NODE_EXECUTABLE} -p
-                "require('path').dirname(process.execPath) + '/include/node'"
+                "require('path').join(require('path').dirname(require('path').dirname(process.execPath)), 'include', 'node')"
             OUTPUT_VARIABLE _node_inc
             OUTPUT_STRIP_TRAILING_WHITESPACE
             RESULT_VARIABLE _node_inc_rc
@@ -96,16 +157,25 @@ if(NOT NODE_INCLUDE_DIRS)
 endif()
 
 message(STATUS "soulx_singer_dit configuration:")
-message(STATUS "  GGML_CPU       = ${GGML_CPU}")
-message(STATUS "  GGML_VULKAN    = ${GGML_VULKAN}")
-message(STATUS "  GGML_CUDA      = ${GGML_CUDA}")
-message(STATUS "  GGML_METAL     = ${GGML_METAL}")
-message(STATUS "  GGML_ACCELERATE= ${GGML_ACCELERATE}")
-message(STATUS "  GGML_BLAS      = ${GGML_BLAS}")
-message(STATUS "  GGML_OPENMP    = ${GGML_OPENMP}")
-message(STATUS "  LLAMA_CPP_DIR  = ${LLAMA_CPP_DIR}")
-message(STATUS "  NODE_ADDON_API = ${NODE_ADDON_API_DIR}")
-message(STATUS "  NODE_INCLUDE   = ${NODE_INCLUDE_DIRS}")
+message(STATUS "  GGML_CPU         = ${GGML_CPU}")
+message(STATUS "  GGML_VULKAN      = ${GGML_VULKAN}")
+message(STATUS "  GGML_CUDA        = ${GGML_CUDA}")
+message(STATUS "  GGML_HIP         = ${GGML_HIP}")
+message(STATUS "  GGML_SYCL        = ${GGML_SYCL}")
+message(STATUS "  GGML_METAL       = ${GGML_METAL}")
+message(STATUS "  GGML_ACCELERATE  = ${GGML_ACCELERATE}")
+message(STATUS "  GGML_BLAS        = ${GGML_BLAS}")
+message(STATUS "  GGML_OPENMP      = ${GGML_OPENMP}")
+message(STATUS "  GGML_NATIVE      = ${GGML_NATIVE}   (OFF => no -march=native, runtime dispatch)")
+message(STATUS "  GGML_AMX_TILE    = ${GGML_AMX_TILE}")
+message(STATUS "  GGML_AMX_INT8    = ${GGML_AMX_INT8}")
+message(STATUS "  GGML_AMX_BF16    = ${GGML_AMX_BF16}")
+message(STATUS "  GGML_NUMA        = ${GGML_NUMA}")
+message(STATUS "  GGML_ARM_ARCH    = ${GGML_ARM_ARCH}")
+message(STATUS "  GGML_CUDA_GRAPHS = ${GGML_CUDA_USE_GRAPHS}")
+message(STATUS "  LLAMA_CPP_DIR    = ${LLAMA_CPP_DIR}")
+message(STATUS "  NODE_ADDON_API   = ${NODE_ADDON_API_DIR}")
+message(STATUS "  NODE_INCLUDE     = ${NODE_INCLUDE_DIRS}")
 
 # ---------------------------------------------------------------------------
 # Configure llama.cpp before add_subdirectory.

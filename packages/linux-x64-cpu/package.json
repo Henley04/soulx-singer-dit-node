@@ -1,0 +1,18 @@
+{
+  "name": "soulx-singer-dit-linux-x64-cpu",
+  "version": "0.1.1",
+  "description": "Prebuilt CPU backend for soulx-singer-dit (Linux x64, runtime AMX/AVX512/AVX2 dispatch)",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "files": ["index.js", "index.d.ts", "cpu.node"],
+  "keywords": ["soulx-singer-dit", "native", "cpu", "linux", "x64"],
+  "license": "MIT",
+  "author": "Henley04",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Henley04/soulx-singer-dit-node.git",
+    "directory": "packages/linux-x64-cpu"
+  }
+}
