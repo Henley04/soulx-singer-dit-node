@@ -57,6 +57,11 @@ struct RNG {
     }
 };
 
+// Forward declaration: the per-T compute graph/arena cache lives in infer.cpp.
+// It is an optimization cache (does not affect the model's logical state) and
+// is therefore mutable so run_forward() can update it through a const Model&.
+struct GraphCache;
+
 // ---------------------------------------------------------------------------
 // mmap'd GGUF model. Quantized weight blobs stay in their packed form; tensor
 // ->data pointers are set directly into the mmap region.
@@ -91,6 +96,11 @@ struct Model {
     bool                        use_gpu     = false;
     int                         n_threads   = 0;   // resolved at load time
     std::string                 backend_name;
+
+    // Per-T compute graph/arena cache (plan item #8). Mutable so it can be
+    // built/refreshed by run_forward() through a const Model&. Owned raw
+    // pointer freed in unload(); null means "not yet built".
+    mutable GraphCache * graph_cache = nullptr;
 
     bool load(const std::string & path_, const std::string & backend_pref = "");
     void unload();

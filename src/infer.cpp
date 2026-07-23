@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -322,21 +323,8 @@ bool Model::load(const std::string & path_, const std::string & backend_pref) {
     return true;
 }
 
-void Model::unload() {
-    if (weight_buf) { ggml_backend_buffer_free(weight_buf); weight_buf = nullptr; }
-    if (backend)    { ggml_backend_free(backend); backend = nullptr; }
-    if (gguf) gguf_free(gguf);
-    if (ctx)  ggml_free(ctx);
-#ifdef _WIN32
-    if (mmap_data) { UnmapViewOfFile(mmap_data); }
-    if (file_mapping) { CloseHandle(file_mapping); file_mapping = nullptr; }
-#else
-    if (mmap_data) munmap(mmap_data, mmap_size);
-    if (fd >= 0) close(fd);
-#endif
-    ctx = nullptr; gguf = nullptr; mmap_data = nullptr; fd = -1;
-    buft = nullptr; use_gpu = false; n_threads = 0;
-}
+// Model::unload() is defined later, after GraphCache (which it must destroy
+// with a complete type — see the GraphCache struct below).
 
 // ---------------------------------------------------------------------------
 // Per-call scratch context: holds all intermediate tensors of one forward
@@ -375,12 +363,16 @@ struct Scratch {
 
 // ---------------------------------------------------------------------------
 // Build a 1D int32 positions tensor [0, 1, ..., T-1] (staged as a leaf).
+// `out_leaf` (if non-null) receives the leaf tensor pointer so callers that
+// cache the graph can refresh its contents later.
 // ---------------------------------------------------------------------------
-static ggml_tensor * make_positions(Scratch & sc, int T) {
+static ggml_tensor * make_positions(Scratch & sc, int T,
+                                    ggml_tensor ** out_leaf = nullptr) {
     ggml_tensor * p = ggml_new_tensor_1d(sc.ctx, GGML_TYPE_I32, T);
     std::vector<int32_t> vals((size_t)T);
     for (int i = 0; i < T; i++) vals[i] = i;
     sc.stage_leaf(p, vals.data(), sizeof(int32_t) * T);
+    if (out_leaf) *out_leaf = p;
     return p;
 }
 
@@ -457,26 +449,37 @@ static ggml_tensor * mlp_forward(
 // via Scratch::stage_leaf() so the GPU compute path can upload it to the
 // device buffer; on the CPU path it is memcpy'd into the scratch buffer.
 // ---------------------------------------------------------------------------
-static ggml_tensor * timestep_forward(
-    Scratch & sc,
-    const Model & m,
-    float t)
-{
-    int half = HIDDEN / 2;
-    ggml_tensor * emb = ggml_new_tensor_1d(sc.ctx, GGML_TYPE_F32, HIDDEN);
 
-    // Build the sinusoidal embedding in a host buffer, then stage it. This
-    // works for both CPU (no_alloc=false) and GPU (no_alloc=true) scratch
-    // contexts: on the GPU path emb->data is null until alloc_ctx_tensors.
+// Build the sinusoidal timestep embedding [HIDDEN] on the host. Extracted so
+// the graph-cache path can recompute it for a new `t` and write it back into
+// the existing leaf tensor without rebuilding the graph.
+static std::vector<float> build_timestep_emb(float t) {
+    int half = HIDDEN / 2;
     std::vector<float> data((size_t)HIDDEN);
     float scale = logf(10000.0f) / (half - 1);
     for (int i = 0; i < half; i++) {
         float freq = expf(-(float)i * scale);
         float angle = t * freq;
-        data[i]         = sinf(angle);
-        data[half + i]  = cosf(angle);
+        data[i]        = sinf(angle);
+        data[half + i] = cosf(angle);
     }
+    return data;
+}
+
+static ggml_tensor * timestep_forward(
+    Scratch & sc,
+    const Model & m,
+    float t,
+    ggml_tensor ** out_emb_leaf = nullptr)
+{
+    ggml_tensor * emb = ggml_new_tensor_1d(sc.ctx, GGML_TYPE_F32, HIDDEN);
+
+    // Build the sinusoidal embedding in a host buffer, then stage it. This
+    // works for both CPU (no_alloc=false) and GPU (no_alloc=true) scratch
+    // contexts: on the GPU path emb->data is null until alloc_ctx_tensors.
+    std::vector<float> data = build_timestep_emb(t);
     sc.stage_leaf(emb, data.data(), sizeof(float) * HIDDEN);
+    if (out_emb_leaf) *out_emb_leaf = emb;
 
     return mlp_forward(sc.ctx, m, "timestep_mlp", emb);  // [hidden]
 }
@@ -494,7 +497,8 @@ static ggml_tensor * decoder_layer(
     int idx,
     ggml_tensor * hidden,
     ggml_tensor * cond,
-    ggml_tensor * positions)
+    ggml_tensor * positions,
+    bool use_flash_attn)
 {
     char nm[128];
 
@@ -537,26 +541,52 @@ static ggml_tensor * decoder_layer(
     k = ggml_permute(ctx, k, 0, 2, 1, 3);
     v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
-    // kq = k^T @ q   (per head)
-    // ggml_mul_mat(A=k=[head_dim, T, n_heads], B=q=[head_dim, T, n_heads])
-    //   -> [T, T, n_heads]   (kq[q_idx, k_idx, h] = sum_d q[q,d,h]*k[k,d,h])
-    ggml_tensor * kq = ggml_mul_mat(ctx, k, q);            // [T, T, 16]
-    kq = ggml_scale(ctx, kq, 1.0f / sqrtf((float)HEAD_DIM));
-    // Non-causal mask with all-ones x_mask: no mask addition needed
-    kq = ggml_soft_max(ctx, kq);                           // softmax over k_idx (ne[0])
+    ggml_tensor * kqv;
+    if (use_flash_attn) {
+        // Flash Attention (plan item #9): fused Q*K^T -> softmax -> *V in a
+        // single kernel. Reduces memory bandwidth (no materialised [T,T] KQ
+        // matrix) and kernel-launch count — especially beneficial under CUDA
+        // Graph capture where each launch is a graph node.
+        //
+        // ggml_flash_attn_ext expects q=[d,T,H,1], k/v=[d,T,H,1] (which we
+        // have after the permute above) and returns [d,H,T,1]. K/V should be
+        // F16 on GPU for the optimised kernel; we follow llama.cpp's pattern
+        // and cast regardless of backend.
+        k = ggml_cast(ctx, k, GGML_TYPE_F16);
+        v = ggml_cast(ctx, v, GGML_TYPE_F16);
 
-    // kqv = v @ kq   (per head)
-    // To make the K dims match (both = T), transpose v so its ne[0] becomes T.
-    //   v was [head_dim, T, n_heads] -> after 2D transpose: [T, head_dim, n_heads]
-    //   ggml_mul_mat(A=v_t=[T, head_dim, n_heads], B=kq=[T, T, n_heads])
-    //     -> [head_dim, T, n_heads]   (kqv[d, q_idx, h] = sum_t attn[q,t,h]*v[t,d,h])
-    v = ggml_cont(ctx, ggml_transpose(ctx, v));
-    ggml_tensor * kqv = ggml_mul_mat(ctx, v, kq);          // [head_dim, T, 16]
+        float attn_scale = 1.0f / sqrtf((float)HEAD_DIM);
+        kqv = ggml_flash_attn_ext(ctx, q, k, v,
+                                  /*mask=*/nullptr, attn_scale,
+                                  /*max_bias=*/0.0f, /*logit_softcap=*/0.0f);
+        ggml_flash_attn_ext_set_prec(kqv, GGML_PREC_F32);
 
-    // Permute back to [head_dim, n_heads, T], then flatten to [hidden, T]
-    kqv = ggml_permute(ctx, kqv, 0, 2, 1, 3);              // [64, 16, T]
-    kqv = ggml_cont(ctx, kqv);
-    kqv = ggml_reshape_2d(ctx, kqv, HIDDEN, /*T=*/kqv->ne[2]);  // [1024, T]
+        // kqv is [HEAD_DIM, NUM_HEADS, T, 1] — already in the layout we need
+        // for the output projection; just flatten to [HIDDEN, T].
+        kqv = ggml_cont(ctx, kqv);
+        kqv = ggml_reshape_2d(ctx, kqv, HIDDEN, T);
+    } else {
+        // kq = k^T @ q   (per head)
+        // ggml_mul_mat(A=k=[head_dim, T, n_heads], B=q=[head_dim, T, n_heads])
+        //   -> [T, T, n_heads]   (kq[q_idx, k_idx, h] = sum_d q[q,d,h]*k[k,d,h])
+        ggml_tensor * kq = ggml_mul_mat(ctx, k, q);            // [T, T, 16]
+        kq = ggml_scale(ctx, kq, 1.0f / sqrtf((float)HEAD_DIM));
+        // Non-causal mask with all-ones x_mask: no mask addition needed
+        kq = ggml_soft_max(ctx, kq);                           // softmax over k_idx (ne[0])
+
+        // kqv = v @ kq   (per head)
+        // To make the K dims match (both = T), transpose v so its ne[0] becomes T.
+        //   v was [head_dim, T, n_heads] -> after 2D transpose: [T, head_dim, n_heads]
+        //   ggml_mul_mat(A=v_t=[T, head_dim, n_heads], B=kq=[T, T, n_heads])
+        //     -> [head_dim, T, n_heads]   (kqv[d, q_idx, h] = sum_t attn[q,t,h]*v[t,d,h])
+        v = ggml_cont(ctx, ggml_transpose(ctx, v));
+        kqv = ggml_mul_mat(ctx, v, kq);          // [head_dim, T, 16]
+
+        // Permute back to [head_dim, n_heads, T], then flatten to [hidden, T]
+        kqv = ggml_permute(ctx, kqv, 0, 2, 1, 3);              // [64, 16, T]
+        kqv = ggml_cont(ctx, kqv);
+        kqv = ggml_reshape_2d(ctx, kqv, HIDDEN, /*T=*/kqv->ne[2]);  // [1024, T]
+    }
 
     snprintf(nm, sizeof(nm), "blk.%d.attn_o.weight", idx);
     ggml_tensor * attn_out = ggml_mul_mat(ctx, m.get_or_die(nm), kqv);  // [hidden, T]
@@ -590,6 +620,14 @@ static ggml_tensor * decoder_layer(
 //   cond: [hidden,  T]   f32
 //   t   : scalar timestep
 //   Returns: [mel_dim, T] f32  (the "velocity" output of the flow-matching net)
+//
+// `use_flash_attn` selects the fused Flash Attention kernel (plan item #9)
+// instead of the manual mul_mat+soft_max+mul_mat path. Enabled on GPU where
+// the optimised CUDA kernel is available.
+//
+// `out_emb_leaf` / `out_pos_leaf` (if non-null) receive the leaf tensor
+// pointers for the timestep embedding and positions so the caller can refresh
+// their contents without rebuilding the graph (plan item #8, graph cache).
 // ---------------------------------------------------------------------------
 static ggml_tensor * dit_forward(
     Scratch & sc,
@@ -597,22 +635,25 @@ static ggml_tensor * dit_forward(
     ggml_tensor * x,
     ggml_tensor * cond,
     float t,
-    int T)
+    int T,
+    bool use_flash_attn = false,
+    ggml_tensor ** out_emb_leaf = nullptr,
+    ggml_tensor ** out_pos_leaf = nullptr)
 {
     ggml_context * ctx = sc.ctx;
 
     // 1) conditioning MLP + mel_in MLP + timestep MLP
     ggml_tensor * cond_emb  = mlp_forward(ctx, m, "cond_mlp",   cond);   // [hidden, T]
     ggml_tensor * x_proj    = mlp_forward(ctx, m, "mel_in_mlp", x);      // [hidden, T]
-    ggml_tensor * diff_step = timestep_forward(sc, m, t);                // [hidden]
+    ggml_tensor * diff_step = timestep_forward(sc, m, t, out_emb_leaf);  // [hidden]
 
     // 2) x = x_proj + cond_emb
     ggml_tensor * h = ggml_add(ctx, x_proj, cond_emb);                   // [hidden, T]
 
     // 3) 22 decoder layers
-    ggml_tensor * positions = make_positions(sc, T);                     // [T] i32
+    ggml_tensor * positions = make_positions(sc, T, out_pos_leaf);       // [T] i32
     for (int i = 0; i < NUM_LAYERS; i++) {
-        h = decoder_layer(ctx, m, i, h, diff_step, positions);           // [hidden, T]
+        h = decoder_layer(ctx, m, i, h, diff_step, positions, use_flash_attn);  // [hidden, T]
     }
 
     // 4) final adaptive RMS norm
@@ -624,21 +665,106 @@ static ggml_tensor * dit_forward(
 }
 
 // ---------------------------------------------------------------------------
+// GraphCache (plan item #8 — CUDA Graph capture / graph reuse)
+//
+// Caches the per-T computation graph, its scratch context, and (on GPU) the
+// backend buffer so that repeated forward passes with the same sequence
+// length T can:
+//   - skip graph rebuilding (the cgraph, tensor metadata, and leaf pointers
+//     are all stable),
+//   - keep tensor data at stable device addresses, which lets the ggml CUDA
+//     backend capture and replay the CUDA graph (eliminating per-kernel
+//     launch overhead).
+//
+// On the first call for a given T the graph is built, intermediates are
+// allocated, and leaves are flushed. On subsequent calls only the four leaf
+// tensors (x, cond, timestep embedding, positions) are refreshed — the
+// timestep embedding changes with `t`; x/cond change every call; positions
+// are always [0..T-1] so they are set once and left alone.
+// ---------------------------------------------------------------------------
+struct GraphCache {
+    int   T = 0;                       // sequence length this entry is built for
+    Scratch * sc = nullptr;            // persistent scratch (owns ggml_context)
+    ggml_cgraph * gf = nullptr;        // pre-built forward graph
+    ggml_backend_buffer_t call_buf = nullptr;  // device buffer (GPU only)
+
+    // Leaf tensors — addresses are stable for the lifetime of this cache;
+    // only their *contents* are refreshed each call.
+    ggml_tensor * x_leaf    = nullptr;  // [MEL_DIM, T]
+    ggml_tensor * cond_leaf = nullptr;  // [HIDDEN,  T]
+    ggml_tensor * emb_leaf  = nullptr;  // [HIDDEN]  timestep embedding
+    ggml_tensor * pos_leaf  = nullptr;  // [T]       positions (set once)
+
+    ggml_tensor * out = nullptr;        // output tensor [MEL_DIM, T]
+
+    ~GraphCache() {
+        // call_buf must be freed *before* the scratch ctx (which owns the
+        // tensor metadata that call_buf backs on the GPU).
+        if (call_buf) ggml_backend_buffer_free(call_buf);
+        delete sc;  // frees the ggml_context and backing buffer
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Refresh the leaf tensor contents for a new forward pass without rebuilding
+// the graph. x/cond change every call; the timestep embedding changes with
+// `t`. Positions are constant [0..T-1] so they are set once during build.
+// ---------------------------------------------------------------------------
+static void refresh_leaves(GraphCache & gc,
+                           const float * x_data, const float * cond_data,
+                           float t, bool use_gpu) {
+    if (use_gpu) {
+        ggml_backend_tensor_set(gc.x_leaf,    x_data,    0, sizeof(float) * MEL_DIM * gc.T);
+        ggml_backend_tensor_set(gc.cond_leaf, cond_data, 0, sizeof(float) * HIDDEN  * gc.T);
+        std::vector<float> emb = build_timestep_emb(t);
+        ggml_backend_tensor_set(gc.emb_leaf,  emb.data(), 0, sizeof(float) * HIDDEN);
+    } else {
+        memcpy(gc.x_leaf->data,    x_data,    sizeof(float) * MEL_DIM * gc.T);
+        memcpy(gc.cond_leaf->data, cond_data, sizeof(float) * HIDDEN  * gc.T);
+        std::vector<float> emb = build_timestep_emb(t);
+        memcpy(gc.emb_leaf->data,  emb.data(), sizeof(float) * HIDDEN);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Model::unload — defined here (after GraphCache) so `delete graph_cache`
+// sees the complete type and actually invokes GraphCache::~GraphCache().
+// ---------------------------------------------------------------------------
+void Model::unload() {
+    if (graph_cache) { delete graph_cache; graph_cache = nullptr; }
+    if (weight_buf) { ggml_backend_buffer_free(weight_buf); weight_buf = nullptr; }
+    if (backend)    { ggml_backend_free(backend); backend = nullptr; }
+    if (gguf) gguf_free(gguf);
+    if (ctx)  ggml_free(ctx);
+#ifdef _WIN32
+    if (mmap_data) { UnmapViewOfFile(mmap_data); }
+    if (file_mapping) { CloseHandle(file_mapping); file_mapping = nullptr; }
+#else
+    if (mmap_data) munmap(mmap_data, mmap_size);
+    if (fd >= 0) close(fd);
+#endif
+    ctx = nullptr; gguf = nullptr; mmap_data = nullptr; fd = -1;
+    buft = nullptr; use_gpu = false; n_threads = 0;
+}
+
+// ---------------------------------------------------------------------------
 // Run a forward pass against the model and copy the result to a host buffer.
 //
-// Two compute paths share the same graph builder (dit_forward):
-//   - GPU  (m.use_gpu && m.backend): the per-call scratch ctx is metadata-only
-//     (no_alloc=true); after building the graph we allocate intermediates in
-//     the backend buffer, upload staged leaves with ggml_backend_tensor_set(),
-//     run via ggml_backend_graph_compute(), and read the output back with
-//     ggml_backend_tensor_get().
-//   - CPU: the per-call scratch ctx backs both metadata and tensor data
-//     (no_alloc=false); staged leaves are memcpy'd into place, and the graph
-//     runs via ggml_graph_compute_with_ctx() using the runtime-resolved thread
-//     count (cgroup- and physical-core-aware).
+// Graph caching (plan item #8): the computation graph, scratch context, and
+// device buffer are cached per-T in m.graph_cache. On a cache hit (same T),
+// only the leaf tensor values are refreshed and the existing graph is
+// re-executed. On GPU this enables automatic CUDA Graph capture/replay by
+// the ggml CUDA backend (stable cgraph pointer + stable tensor addresses).
 //
-// Leaf inputs (x, cond, timestep embedding, positions) are always staged via
-// Scratch::stage_leaf(), so the builder stays backend-agnostic.
+// Flash Attention (plan item #9): on GPU the fused ggml_flash_attn_ext
+// kernel replaces the manual mul_mat+soft_max+mul_mat attention, reducing
+// memory bandwidth and kernel-launch count.
+//
+// Two compute paths share the same graph builder (dit_forward):
+//   - GPU  (m.use_gpu && m.backend): scratch ctx is metadata-only
+//     (no_alloc=true); intermediates live in the cached backend buffer.
+//   - CPU: scratch ctx backs both metadata and data (no_alloc=false).
+//
 // (External linkage — called from binding.cc.)
 // ---------------------------------------------------------------------------
 std::vector<float> run_forward(
@@ -649,56 +775,85 @@ std::vector<float> run_forward(
     int T)
 {
     const bool use_gpu = m.use_gpu && m.backend;
-    // CPU scratch also holds tensor *data* (1 GiB is plenty for 22 layers at
-    // T=64). GPU scratch is metadata-only; 256 MiB comfortably fits the
-    // tensor structs + cgraph nodes for the DiT.
-    Scratch sc(use_gpu ? (1ULL << 28) : (1ULL << 30), use_gpu);
-
-    ggml_tensor * x    = ggml_new_tensor_2d(sc.ctx, GGML_TYPE_F32, MEL_DIM, T);
-    ggml_tensor * cond = ggml_new_tensor_2d(sc.ctx, GGML_TYPE_F32, HIDDEN,  T);
-    sc.stage_leaf(x,    x_data,    sizeof(float) * MEL_DIM * T);
-    sc.stage_leaf(cond, cond_data, sizeof(float) * HIDDEN  * T);
-
-    ggml_tensor * out = dit_forward(sc, m, x, cond, t, T);   // [mel_dim, T]
-
-    ggml_cgraph * gf = ggml_new_graph_custom(sc.ctx, 1 << 18, false);
-    ggml_build_forward_expand(gf, out);
+    const bool use_flash_attn = use_gpu;  // Flash Attention on GPU only
 
     std::vector<float> result((size_t)MEL_DIM * T);
 
-    if (use_gpu) {
-        // Allocate intermediate tensors in the backend (VRAM) buffer.
-        ggml_backend_buffer_t call_buf =
-            ggml_backend_alloc_ctx_tensors(sc.ctx, m.backend);
-        if (!call_buf) {
-            fprintf(stderr, "FATAL: ggml_backend_alloc_ctx_tensors failed "
-                            "(backend='%s')\n", m.backend_name.c_str());
-            return result;
+    // ---- Cache hit: reuse the existing graph for this T ----
+    GraphCache * gc = m.graph_cache;
+    if (gc && gc->T == T && gc->gf) {
+        refresh_leaves(*gc, x_data, cond_data, t, use_gpu);
+
+        if (use_gpu) {
+            if (ggml_backend_graph_compute(m.backend, gc->gf) != GGML_STATUS_SUCCESS) {
+                fprintf(stderr, "FATAL: ggml_backend_graph_compute (cached) failed "
+                                "(backend='%s')\n", m.backend_name.c_str());
+                return result;
+            }
+            ggml_backend_tensor_get(gc->out, result.data(), 0,
+                                    sizeof(float) * MEL_DIM * T);
+        } else {
+            ggml_graph_compute_with_ctx(gc->sc->ctx, gc->gf, m.n_threads);
+            memcpy(result.data(), gc->out->data, sizeof(float) * MEL_DIM * T);
         }
-        // Flush staged leaves into device memory.
-        for (const auto & l : sc.leaves) {
-            ggml_backend_tensor_set(l.t, l.data.data(), 0, l.data.size());
-        }
-        // Run on the GPU backend.
-        if (ggml_backend_graph_compute(m.backend, gf) != GGML_STATUS_SUCCESS) {
-            fprintf(stderr, "FATAL: ggml_backend_graph_compute failed "
-                            "(backend='%s')\n", m.backend_name.c_str());
-            ggml_backend_buffer_free(call_buf);
-            return result;
-        }
-        // Copy the output tensor back to host.
-        ggml_backend_tensor_get(out, result.data(), 0,
-                                sizeof(float) * MEL_DIM * T);
-        ggml_backend_buffer_free(call_buf);
-    } else {
-        // CPU: leaves point into the metadata+data scratch buffer; flush them.
-        for (const auto & l : sc.leaves) {
-            memcpy(l.t->data, l.data.data(), l.data.size());
-        }
-        ggml_graph_compute_with_ctx(sc.ctx, gf, m.n_threads);
-        memcpy(result.data(), out->data, sizeof(float) * MEL_DIM * T);
+        return result;
     }
 
+    // ---- Cache miss: build a new graph and cache it ----
+    if (gc) { delete gc; gc = nullptr; }
+    gc = new GraphCache();
+    gc->T = T;
+    // CPU scratch also holds tensor *data* (1 GiB is plenty for 22 layers at
+    // T=64). GPU scratch is metadata-only; 256 MiB fits the tensor structs +
+    // cgraph nodes for the DiT.
+    gc->sc = new Scratch(use_gpu ? (1ULL << 28) : (1ULL << 30), use_gpu);
+
+    // Leaf input tensors — their addresses stay fixed for the cache lifetime.
+    gc->x_leaf    = ggml_new_tensor_2d(gc->sc->ctx, GGML_TYPE_F32, MEL_DIM, T);
+    gc->cond_leaf = ggml_new_tensor_2d(gc->sc->ctx, GGML_TYPE_F32, HIDDEN,  T);
+    gc->sc->stage_leaf(gc->x_leaf,    x_data,    sizeof(float) * MEL_DIM * T);
+    gc->sc->stage_leaf(gc->cond_leaf, cond_data, sizeof(float) * HIDDEN  * T);
+
+    // Build the DiT graph, exposing the timestep-emb and positions leaves.
+    gc->out = dit_forward(*gc->sc, m, gc->x_leaf, gc->cond_leaf, t, T,
+                          use_flash_attn, &gc->emb_leaf, &gc->pos_leaf);
+
+    // Build the cgraph.
+    gc->gf = ggml_new_graph_custom(gc->sc->ctx, 1 << 18, false);
+    ggml_build_forward_expand(gc->gf, gc->out);
+
+    if (use_gpu) {
+        // Allocate intermediate tensors in the backend (VRAM) buffer.
+        gc->call_buf = ggml_backend_alloc_ctx_tensors(gc->sc->ctx, m.backend);
+        if (!gc->call_buf) {
+            fprintf(stderr, "FATAL: ggml_backend_alloc_ctx_tensors failed "
+                            "(backend='%s')\n", m.backend_name.c_str());
+            m.graph_cache = gc;  // keep partial cache so destructor cleans up
+            return result;
+        }
+        // Flush staged leaves into device memory (first time only).
+        for (const auto & l : gc->sc->leaves) {
+            ggml_backend_tensor_set(l.t, l.data.data(), 0, l.data.size());
+        }
+        // Run on the GPU backend (first run captures the CUDA graph).
+        if (ggml_backend_graph_compute(m.backend, gc->gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "FATAL: ggml_backend_graph_compute failed "
+                            "(backend='%s')\n", m.backend_name.c_str());
+            m.graph_cache = gc;
+            return result;
+        }
+        ggml_backend_tensor_get(gc->out, result.data(), 0,
+                                sizeof(float) * MEL_DIM * T);
+    } else {
+        // CPU: leaves point into the metadata+data scratch buffer; flush them.
+        for (const auto & l : gc->sc->leaves) {
+            memcpy(l.t->data, l.data.data(), l.data.size());
+        }
+        ggml_graph_compute_with_ctx(gc->sc->ctx, gc->gf, m.n_threads);
+        memcpy(result.data(), gc->out->data, sizeof(float) * MEL_DIM * T);
+    }
+
+    m.graph_cache = gc;
     return result;
 }
 
