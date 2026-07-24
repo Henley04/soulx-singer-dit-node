@@ -37,6 +37,10 @@ jobs:
   build:
     name: Build ${{ matrix.platform_key }}-${{ matrix.backend }}
     runs-on: ${{ matrix.runs_on }}
+    # Fail fast on a hung build instead of waiting the full 6h GitHub limit.
+    # CPU/Vulkan builds finish in <5 min; even the CUDA build (now arch-limited)
+    # should complete well within 60 min. If a job hits this it is genuinely stuck.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -289,7 +293,12 @@ jobs:
             $extra_args
 
       - name: Build
-        run: cmake --build build --config Release --parallel
+        # Cap parallel jobs so nvcc (CUDA) does not OOM the runner. Each nvcc
+        # invocation for a fatbinaried CUDA kernel can use >2 GB RAM; unlimited
+        # --parallel on a 4-core runner runs out of memory and either crashes
+        # or thrashes swap for hours. 4 keeps CPU/Vulkan builds fast while
+        # bounding CUDA memory pressure.
+        run: cmake --build build --config Release --parallel 4
 
       - name: Rename .node file
         shell: bash

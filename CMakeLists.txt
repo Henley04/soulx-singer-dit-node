@@ -89,8 +89,22 @@ endif()
 
 # CUDA graphs: capture the per-step graph once and replay it, eliminating
 # per-kernel launch overhead (22 layers x dozens of kernels per step).
+#
+# CRITICAL: restrict the target CUDA architectures. llama.cpp's default
+# (GGML_CUDA_ALL_ARCHS=ON) compiles every ggml CUDA kernel (mmvq/mmq/conv/
+# norm/...) for ~10 compute capabilities (6.0 through 9.0). On a 4-core CI
+# runner nvcc takes 5+ hours and blows past the GitHub Actions 6h job limit.
+# We target only modern consumer/datacenter GPUs so the build finishes in a
+# few minutes; older GPUs (Pascal/Volta) fall back to the CPU backend at
+# runtime. Override locally with -DCMAKE_CUDA_ARCHITECTURES=... if needed.
+#   75 = Turing  (RTX 20xx, T4)
+#   80 = Ampere  (A100)
+#   86 = Ampere  (RTX 30xx, A10/A40)
+#   89 = Ada     (RTX 40xx, L4)
 if(GGML_CUDA)
     set(GGML_CUDA_USE_GRAPHS ON CACHE BOOL "Use CUDA graph capture" FORCE)
+    set(GGML_CUDA_ALL_ARCHS OFF CACHE BOOL "Build only the arch subset below" FORCE)
+    set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89" CACHE STRING "Target CUDA architectures" FORCE)
 endif()
 
 # ---------------------------------------------------------------------------
