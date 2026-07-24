@@ -90,21 +90,40 @@ endif()
 # CUDA graphs: capture the per-step graph once and replay it, eliminating
 # per-kernel launch overhead (22 layers x dozens of kernels per step).
 #
-# CRITICAL: restrict the target CUDA architectures. llama.cpp's default
-# (GGML_CUDA_ALL_ARCHS=ON) compiles every ggml CUDA kernel (mmvq/mmq/conv/
-# norm/...) for ~10 compute capabilities (6.0 through 9.0). On a 4-core CI
-# runner nvcc takes 5+ hours and blows past the GitHub Actions 6h job limit.
-# We target only modern consumer/datacenter GPUs so the build finishes in a
-# few minutes; older GPUs (Pascal/Volta) fall back to the CPU backend at
-# runtime. Override locally with -DCMAKE_CUDA_ARCHITECTURES=... if needed.
-#   75 = Turing  (RTX 20xx, T4)
-#   80 = Ampere  (A100)
-#   86 = Ampere  (RTX 30xx, A10/A40)
-#   89 = Ada     (RTX 40xx, L4)
+# Target CUDA architectures: covers the full range from Pascal (GTX 10xx,
+# compute capability 6.0) through Blackwell (RTX 50xx / GB10 DGX Spark,
+# compute capability 12.1).
+#
+# sm_121 (DGX Spark / GB10) requires CUDA Toolkit 12.9+ — nvcc in 12.8 only
+# knew about sm_100/101/120. The CI workflow installs 12.9.0
+# (Jimver/cuda-toolkit). CUDA 12.9 also emits deprecation *warnings* for
+# CC < 7.5 (sm_60/61/70/72); these are expected and non-fatal — CUDA 13.0
+# will hard-remove those archs, at which point drop 60/61/70 from this list.
+#
+# Compiling ~11 architectures x dozens of ggml CUDA kernels (mmvq/mmq/conv/
+# norm/...) is expensive: nvcc takes ~1-2h on a 4-core CI runner. The build
+# workflow mitigates this with:
+#   - ccache (CMAKE_{CXX,CUDA}_COMPILER_LAUNCHER=ccache) for incremental hits
+#   - bounded --parallel to avoid nvcc OOM
+#   - a generous job timeout-minutes so the first cold build can complete
+# Disable an arch you don't need locally with -DCMAKE_CUDA_ARCHITECTURES=...
+#
+#   60  = Pascal      (GTX 10xx baseline)
+#   61  = Pascal      (GTX 1080/1070/1080 Ti)
+#   70  = Volta       (V100, Titan V)
+#   75  = Turing      (RTX 20xx, T4)
+#   80  = Ampere      (A100)
+#   86  = Ampere      (RTX 30xx, A10/A40)
+#   89  = Ada         (RTX 40xx, L4)
+#   90  = Hopper      (H100)
+#   100 = Blackwell   (B100/B200)
+#   120 = Blackwell   (RTX 50xx)
+#   121 = Blackwell   (GB10 / DGX Spark)  [requires CUDA 12.9+]
 if(GGML_CUDA)
     set(GGML_CUDA_USE_GRAPHS ON CACHE BOOL "Use CUDA graph capture" FORCE)
     set(GGML_CUDA_ALL_ARCHS OFF CACHE BOOL "Build only the arch subset below" FORCE)
-    set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89" CACHE STRING "Target CUDA architectures" FORCE)
+    set(CMAKE_CUDA_ARCHITECTURES "60;61;70;75;80;86;89;90;100;120;121"
+        CACHE STRING "Target CUDA architectures (Pascal..Blackwell)" FORCE)
 endif()
 
 # ---------------------------------------------------------------------------

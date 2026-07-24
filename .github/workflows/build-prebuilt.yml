@@ -38,9 +38,11 @@ jobs:
     name: Build ${{ matrix.platform_key }}-${{ matrix.backend }}
     runs-on: ${{ matrix.runs_on }}
     # Fail fast on a hung build instead of waiting the full 6h GitHub limit.
-    # CPU/Vulkan builds finish in <5 min; even the CUDA build (now arch-limited)
-    # should complete well within 60 min. If a job hits this it is genuinely stuck.
-    timeout-minutes: 60
+    # CPU/Vulkan builds finish in <5 min. The CUDA build fatbinaries 11 archs
+    # (Pascal..Blackwell); a cold nvcc compile is ~1-2h, a ccache hit is ~5m.
+    # 180 min leaves headroom for the first cold build while still catching
+    # genuine hangs well before the 6h job-kill.
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -116,9 +118,34 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install ninja -y --no-progress
+          choco install ninja ccache -y --no-progress
           refreshenv 2>$null
           ninja --version
+          ccache --version | Select-Object -First 1
+
+      # ccache caches nvcc/g++/cl object files. The CUDA build fatbinaries
+      # ~11 compute capabilities x dozens of kernels, so a cold build is
+      # ~1-2h; ccache turns repeat builds (re-runs, tag pushes, dependabot
+      # bumps) into minutes. CCACHE_DIR is set here so both the cache action
+      # below and cmake (via the launcher) agree on the location.
+      - name: Configure ccache
+        shell: bash
+        run: |
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+          mkdir -p "$HOME/.ccache"
+          ccache --set-config=max_size=1G
+          ccache --set-config=compression=true
+          ccache --set-config=hash_dir=false
+          ccache -z
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ matrix.platform_key }}-${{ matrix.backend }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.platform_key }}-${{ matrix.backend }}-
+            ccache-${{ matrix.platform_key }}-
 
       - name: Install node-addon-api
         run: npm install node-addon-api
@@ -235,16 +262,18 @@ jobs:
           "VULKAN_SDK=$sdkRoot" | Out-File $env:GITHUB_ENV -Append
           "$sdkRoot\Bin" | Out-File $env:GITHUB_PATH -Append
 
-      # CUDA backend: 12.8.0 supports MSVC 14.4x+ (VS 2022 17.10+).  The
-      # older action v0.2.15 only knew about CUDA ≤ 12.4.1; v0.2.35 fetches
-      # the version list dynamically from NVIDIA's CDN, so 12.8.0 resolves.
-      # No sub-packages filter — the full toolkit ensures cublas.lib and
-      # headers are present so CMake can create the CUDA::cublas target.
+      # CUDA backend: 12.9.0 is required for sm_121 (DGX Spark / GB10).
+      # CUDA 12.8 only added nvcc support for sm_100/101/120; sm_121 was
+      # introduced in 12.9 (see `nvcc --list-gpu-arch` on 12.9). 12.9 also
+      # emits deprecation *warnings* (not errors) for CC < 7.5 (sm_60/61/70/72),
+      # which we keep so users know Pascal/Volta are on the way out; CUDA 13.0
+      # will hard-remove them. v0.2.35 of this action fetches the version list
+      # dynamically from NVIDIA's CDN, so 12.9.0 resolves without a bump.
       - name: Setup CUDA
         if: matrix.backend == 'cuda'
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
-          cuda: '12.8.0'
+          cuda: '12.9.0'
           method: 'network'
 
       - name: Set CUDA compiler flags
@@ -287,8 +316,15 @@ jobs:
           # by the "Download Node.js headers" step and picked up automatically
           # by CMakeLists.txt. On Linux/macOS the headers are auto-detected
           # from the setup-node distribution.
+          #
+          # CMAKE_{CXX,CUDA}_COMPILER_LAUNCHER=ccache wraps every compiler
+          # invocation (cl.exe/g++/nvcc) so object files are cached in
+          # CCACHE_DIR. This is what makes the CUDA build (11 archs x dozens
+          # of kernels) survivable on re-runs.
           cmake -B build -G "Ninja" \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
             ${{ matrix.cmake_opts }} \
             $extra_args
 
@@ -299,6 +335,13 @@ jobs:
         # or thrashes swap for hours. 4 keeps CPU/Vulkan builds fast while
         # bounding CUDA memory pressure.
         run: cmake --build build --config Release --parallel 4
+
+      - name: Print ccache stats
+        if: always()
+        shell: bash
+        run: |
+          echo "--- ccache statistics ---"
+          ccache -s 2>/dev/null || echo "(ccache not available)"
 
       - name: Rename .node file
         shell: bash
