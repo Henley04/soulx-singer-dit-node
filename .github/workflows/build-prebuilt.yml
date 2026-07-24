@@ -79,19 +79,17 @@ jobs:
             artifact_name: cpu.node
             platform_key: linux-arm64
           # ---- macOS arm64 (Apple Silicon, Accelerate) ----
+          # macOS x64 (Intel) is intentionally omitted: GitHub Actions has
+          # deprecated/removed the macos-13 (Intel) runners, so darwin-x64
+          # builds cannot be produced in CI. Apple Silicon users (the vast
+          # majority of current Macs) get darwin-arm64; Intel Mac users can
+          # build from source.
           - os: macos
             backend: cpu
             runs_on: macos-14
             cmake_opts: '-DGGML_CPU=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_ACCELERATE=ON'
             artifact_name: cpu.node
             platform_key: darwin-arm64
-          # ---- macOS x64 (Intel, Accelerate) ----
-          - os: macos
-            backend: cpu
-            runs_on: macos-13
-            cmake_opts: '-DGGML_CPU=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_ACCELERATE=ON'
-            artifact_name: cpu.node
-            platform_key: darwin-x64
 
     steps:
       - name: Checkout
@@ -365,7 +363,7 @@ jobs:
           combos="
             win32-x64-cpu win32-x64-vulkan win32-x64-cuda
             linux-x64-cpu linux-arm64-cpu
-            darwin-arm64-cpu darwin-x64-cpu
+            darwin-arm64-cpu
           "
           # Remove stale .node files from the repo checkout so we never
           # accidentally publish old/placeholder binaries.

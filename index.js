@@ -51,9 +51,6 @@ const PLATFORM_BACKENDS = {
   'darwin-arm64': {
     cpu: 'soulx-singer-dit-darwin-arm64-cpu',
   },
-  'darwin-x64': {
-    cpu: 'soulx-singer-dit-darwin-x64-cpu',
-  },
   // No prebuilts shipped for the following; listed explicitly so the error
   // message can mention them rather than emit a generic "unsupported".
   'linux-arm': null,
@@ -117,7 +114,7 @@ function loadNative(backend) {
       'soulx-singer-dit has no prebuilt binary for platform ' +
         JSON.stringify(key) + '.\n' +
         'Supported prebuilt platforms: win32-x64, linux-x64, linux-arm64, ' +
-        'darwin-arm64, darwin-x64.\n' +
+        'darwin-arm64.\n' +
         'To build from source, see the repository README.'
     );
   }

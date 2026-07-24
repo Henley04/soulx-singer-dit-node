@@ -93,7 +93,7 @@ jobs:
           combos="
             win32-x64-cpu win32-x64-vulkan win32-x64-cuda
             linux-x64-cpu linux-arm64-cpu
-            darwin-arm64-cpu darwin-x64-cpu
+            darwin-arm64-cpu
           "
           for combo in $combos; do
             backend="${combo##*-}"
@@ -163,17 +163,9 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Publish macOS x64 CPU subpackage
-        if: hashFiles('packages/darwin-x64-cpu/cpu.node') != ''
-        run: |
-          cd packages/darwin-x64-cpu
-          npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
       - name: Publish main package
         # Only publish the umbrella package if at least one backend built.
-        if: hashFiles('packages/win32-x64-cpu/cpu.node') != '' || hashFiles('packages/win32-x64-vulkan/vulkan.node') != '' || hashFiles('packages/win32-x64-cuda/cuda.node') != '' || hashFiles('packages/linux-x64-cpu/cpu.node') != '' || hashFiles('packages/linux-arm64-cpu/cpu.node') != '' || hashFiles('packages/darwin-arm64-cpu/cpu.node') != '' || hashFiles('packages/darwin-x64-cpu/cpu.node') != ''
+        if: hashFiles('packages/win32-x64-cpu/cpu.node') != '' || hashFiles('packages/win32-x64-vulkan/vulkan.node') != '' || hashFiles('packages/win32-x64-cuda/cuda.node') != '' || hashFiles('packages/linux-x64-cpu/cpu.node') != '' || hashFiles('packages/linux-arm64-cpu/cpu.node') != '' || hashFiles('packages/darwin-arm64-cpu/cpu.node') != ''
         run: |
           npm publish --provenance --access public
         env:
