@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -200,6 +201,57 @@ ggml_backend_t pick_backend(const std::string & pref, bool & out_is_gpu,
 }
 
 // ---------------------------------------------------------------------------
+// read_hparam_int — read an int-typed hparam from the GGUF metadata, returning
+// `def` if the key is absent or has an unexpected type.
+//
+// Used to resolve per-variant architectural knobs (e.g. NUM_LAYERS) from the
+// standard llama.cpp metadata keys written by convert_dit_to_gguf.py. Any
+// integer GGUF value type (i32/u32/i64/u64) is accepted; non-integer types
+// fall through to the default.
+// ---------------------------------------------------------------------------
+static int read_hparam_int(const gguf_context * gguf, const char * key, int def) {
+    int idx = gguf_find_key(gguf, key);
+    if (idx < 0) return def;
+    enum gguf_type t = gguf_get_kv_type(gguf, idx);
+    switch (t) {
+        case GGUF_TYPE_INT32:  return (int)gguf_get_val_i32(gguf, idx);
+        case GGUF_TYPE_UINT32: return (int)gguf_get_val_u32(gguf, idx);
+        case GGUF_TYPE_INT64:  return (int)gguf_get_val_i64(gguf, idx);
+        case GGUF_TYPE_UINT64: return (int)gguf_get_val_u64(gguf, idx);
+        default:               return def;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// count_decoder_layers — robust fallback for resolving NUM_LAYERS when the
+// GGUF metadata does not carry llama.block_count (e.g. older convert_dit_to_gguf.py
+// outputs). The C++ inference path already assumes the standard llama.cpp
+// tensor naming `blk.%d.attn_q.weight`, so counting those tensors is a
+// reliable signal of how many decoder layers the GGUF actually contains.
+//
+// Layers are 0-indexed and contiguous; max_index + 1 is the count. Returns 0
+// if no matching tensors are found (caller should then fall back to the
+// NUM_LAYERS default).
+// ---------------------------------------------------------------------------
+static int count_decoder_layers(const gguf_context * gguf) {
+    int n_tensors = (int)gguf_get_n_tensors(gguf);
+    int max_idx = -1;
+    for (int i = 0; i < n_tensors; i++) {
+        const char * name = gguf_get_tensor_name(gguf, i);
+        if (!name) continue;
+        // Match "blk.%d.attn_q.weight"
+        if (strncmp(name, "blk.", 4) != 0) continue;
+        const char * rest = name + 4;
+        char * end = nullptr;
+        long idx = std::strtol(rest, &end, 10);
+        if (end == rest) continue;                 // no digits parsed
+        if (strncmp(end, ".attn_q.weight", 14) != 0) continue;
+        if (idx > max_idx) max_idx = (int)idx;
+    }
+    return max_idx + 1;
+}
+
+// ---------------------------------------------------------------------------
 // Model::load / Model::unload
 // ---------------------------------------------------------------------------
 bool Model::load(const std::string & path_, const std::string & backend_pref) {
@@ -260,6 +312,29 @@ bool Model::load(const std::string & path_, const std::string & backend_pref) {
         return false;
     }
 
+    // ---- Resolve per-variant architectural knobs ----
+    // NUM_LAYERS varies across DiT variants: teacher=22, distilled
+    // baseline-distill=11, ProbeKD/HiddenMatch/On-Policy/Wass students=4.
+    // Prefer the GGUF metadata (llama.block_count, the standard llama.cpp
+    // key written by convert_dit_to_gguf.py); fall back to counting the
+    // `blk.N.attn_q.weight` tensors (robust against older convert scripts
+    // that may have omitted the metadata); finally fall back to the NUM_LAYERS
+    // constexpr (22) so legacy teacher GGUFs keep working unchanged.
+    //
+    // All other knobs (HIDDEN, NUM_HEADS, HEAD_DIM, FFN intermediate) are
+    // either shared across all variants or read implicitly from tensor
+    // shapes via ggml_mul_mat, so they need no per-variant resolution.
+    {
+        int md_layers = read_hparam_int(gguf, "llama.block_count", -1);
+        if (md_layers > 0) {
+            num_layers = md_layers;
+        } else {
+            int counted = count_decoder_layers(gguf);
+            if (counted > 0) num_layers = counted;
+            // else: keep the struct default (NUM_LAYERS = 22).
+        }
+    }
+
     // ---- Resolve the runtime backend + thread count ----
     bool is_gpu = false;
     std::string bname;
@@ -297,8 +372,8 @@ bool Model::load(const std::string & path_, const std::string & backend_pref) {
             if (mmap_data) { munmap(mmap_data, mmap_size); mmap_data = nullptr; }
             if (fd >= 0) { close(fd); fd = -1; }
 #endif
-            printf("  loaded %s on GPU '%s': %d tensors uploaded (%.1f MiB), %d cpu threads\n",
-                   path.c_str(), bname.c_str(), n_tensors,
+            printf("  loaded %s on GPU '%s': %d tensors (%d layers), %.1f MiB, %d cpu threads\n",
+                   path.c_str(), bname.c_str(), n_tensors, num_layers,
                    (double)mmap_size / (1 << 20), n_threads);
             return true;
         }
@@ -316,9 +391,10 @@ bool Model::load(const std::string & path_, const std::string & backend_pref) {
         t->data = (char *)mmap_data + data_offset + off;
     }
 
-    printf("  loaded %s on CPU (mmap zero-copy): %d tensors, %.1f MiB, "
-           "%d threads, numa=%d, amx_int8=%d\n",
-           path.c_str(), n_tensors, (double)mmap_size / (1 << 20),
+    printf("  loaded %s on CPU (mmap zero-copy): %d tensors (%d layers), "
+           "%.1f MiB, %d threads, numa=%d, amx_int8=%d\n",
+           path.c_str(), n_tensors, num_layers,
+           (double)mmap_size / (1 << 20),
            n_threads, (int)ggml_is_numa(), (int)ggml_cpu_has_amx_int8());
     return true;
 }
@@ -650,9 +726,10 @@ static ggml_tensor * dit_forward(
     // 2) x = x_proj + cond_emb
     ggml_tensor * h = ggml_add(ctx, x_proj, cond_emb);                   // [hidden, T]
 
-    // 3) 22 decoder layers
+    // 3) decoder layers (count is per-variant: teacher=22, distilled
+    //    students=4 or 11; resolved from GGUF metadata at Model::load time)
     ggml_tensor * positions = make_positions(sc, T, out_pos_leaf);       // [T] i32
-    for (int i = 0; i < NUM_LAYERS; i++) {
+    for (int i = 0; i < m.num_layers; i++) {
         h = decoder_layer(ctx, m, i, h, diff_step, positions, use_flash_attn);  // [hidden, T]
     }
 

@@ -121,6 +121,88 @@ model.release();
 
 ---
 
+## 支持的模型 / Supported Models
+
+本绑定支持 [SoulX-Singer](https://github.com/SoulX-AI/SoulX-Singer) 上游 22 层教师模型，以及
+[`syxppp/SoulX-Singer-DiT-Distilled`](https://www.modelscope.cn/models/syxppp/SoulX-Singer-DiT-Distilled)
+仓库中的所有**非 GQA** 蒸馏/剪枝学生变体（4 层或 11 层，与教师同架构——仅层数与 FFN 中间维不同）。
+所有变体共享 `MEL_DIM=128 / HIDDEN=1024 / NUM_HEADS=16 / HEAD_DIM=64`，因此只需在加载时按变体解析
+`NUM_LAYERS` 即可（FFN 中间维度由 `ggml_mul_mat` 从权重张量 shape 隐式读取，无需任何代码改动）。
+
+### 支持的 GGUF 文件
+
+| 文件 | 变体 | 层数 | FFN 中间维 | 量化 | 大小 | 质量（cos vs 教师） | 备注 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `soulx-singer-dit-fp32.gguf` | teacher | 22 | 4096 | F32 | 1690 MB | 1.000（基准） | 上游教师模型，原始基线 |
+| `student_distilled.fp32.gguf` | baseline-distill | 11 | 4096 | F32 | 896 MB | 0.949 | 基准蒸馏（uniform 抽层 + MSE） |
+| `student_hidden.fp32.gguf` | ProbeKD-HiddenMatch | 4 | 4096 | F32 | 392 MB | 0.932 | 4 层未剪枝最佳质量 |
+| `student_hidden.q8_0.gguf` | ProbeKD-HiddenMatch | 4 | 4096 | Q8_0 | 104 MB | ≈0.93 | 同上，Q8_0 量化 |
+| `student_hidden.q4_k_m.gguf` | ProbeKD-HiddenMatch | 4 | 4096 | Q4_K_M | 57 MB | ≈0.93 | 同上，Q4_K_M 量化 |
+| `student_pruned_r50.fp32.gguf` | HiddenMatch+Prune50% | 4 | 2048 | F32 | 246 MB | 0.956 | **质量最高** |
+| `student_pruned_r50.q8_0.gguf` | HiddenMatch+Prune50% | 4 | 2048 | Q8_0 | 65 MB | ≈0.95 | **质量优先推荐** |
+| `student_pruned_r50.q4_k_m.gguf` | HiddenMatch+Prune50% | 4 | 2048 | Q4_K_M | 36 MB | ≈0.95 | 同上，Q4_K_M 量化 |
+| `student_pruned_r25.fp32.gguf` | HiddenMatch+Prune75% | 4 | 1024 | F32 | 173 MB | 0.949 | FFN 剪枝 75% |
+| `student_pruned_r25.q8_0.gguf` | HiddenMatch+Prune75% | 4 | 1024 | Q8_0 | 46 MB | ≈0.95 | **🏆 综合最佳**（速度+体积+质量） |
+| `student_pruned_r25.q4_k_m.gguf` | HiddenMatch+Prune75% | 4 | 1024 | Q4_K_M | 25 MB | ≈0.95 | 最小体积 |
+| `student_pruned_r25_finetuned_v3.q8_0.gguf` | HiddenMatch+Prune75% + KD-finetune | 4 | 1024 | Q8_0 | 48 MB | ≈0.90（域外）/ 0.94（域内） | **FINETUNE_REPORT 推荐微调版**，与 `pruned_r25.q8_0` 同架构，直接替换即可 |
+| `student_wass.fp32.gguf` | ProbeKD-Wass | 4 | 4096 | F32 | 392 MB | 0.685 | 质量较差，仅供实验 |
+| `student_wass.q8_0.gguf` | ProbeKD-Wass | 4 | 4096 | Q8_0 | 104 MB | ≈0.68 | 同上 |
+| `student_wass.q4_k_m.gguf` | ProbeKD-Wass | 4 | 4096 | Q4_K_M | 57 MB | ≈0.68 | 同上 |
+| `student_onpolicy.fp32.gguf` | On-Policy Self-Distill | 4 | 4096 | F32 | 392 MB | 0.410 | 质量较差，仅供实验 |
+| `student_onpolicy.q8_0.gguf` | On-Policy Self-Distill | 4 | 4096 | Q8_0 | 104 MB | ≈0.41 | 同上 |
+| `student_onpolicy.q4_k_m.gguf` | On-Policy Self-Distill | 4 | 4096 | Q4_K_M | 57 MB | ≈0.41 | 同上 |
+
+> 质量指标取自蒸馏仓库 README.md / FINETUNE_REPORT.md 中对教师输出（50 个 held-out 真实 mel 样本，
+> T=256）的余弦相似度。带「≈」者为同变体 FP32 指标的近似估计（量化本身在该量级仅有 ~0.005-0.01 影响）。
+
+### 推荐选择
+
+- **🏆 综合最佳**：`student_pruned_r25.q8_0.gguf` —— 46 MB，4 层，3.55x 加速，余弦 0.949。
+- **质量优先**：`student_pruned_r50.q8_0.gguf` —— 65 MB，4 层，余弦 0.956（最高）。
+- **微调版**：`student_pruned_r25_finetuned_v3.q8_0.gguf` —— 与 `pruned_r25.q8_0` 同架构，
+  KD 微调后域内数据上可达 10x 加速，直接替换 `pruned_r25.q8_0` 即可，无需改代码。
+- **极小体积**：`student_pruned_r25.q4_k_m.gguf` —— 25 MB，适合嵌入式 / 边缘场景。
+- **教师基线**：`soulx-singer-dit-fp32.gguf` —— 22 层原模型，精度最高但最慢。
+
+### 加载蒸馏模型
+
+加载方式与教师模型完全一致——`loadModel` / `new Model` 接受任何上述 GGUF 路径，C++ 运行时自动从
+GGUF 元数据读取层数：
+
+```js
+const { loadModel, MEL_DIM, HIDDEN } = require('soulx-singer-dit');
+
+// 加载综合最佳的蒸馏剪枝模型
+const model = await loadModel('/path/to/student_pruned_r25.q8_0.gguf', { backend: 'cpu' });
+// 加载日志会打印 "loaded ... 4 layers" 表示已识别为 4 层学生变体
+
+// API 完全一致——forward / reverseDiffusion 的输入输出 shape 不变
+// （MEL_DIM=128 / HIDDEN=1024 在所有变体上相同）
+const T = 64;
+const x    = new Float32Array(MEL_DIM * T);
+const cond = new Float32Array(HIDDEN * T);
+const v = model.forward({ x, cond, t: 0.5, T });
+```
+
+### 暂不支持的变体
+
+下列 GGUF 文件位于 `SoulX-Singer-DiT-Distilled` 仓库但**当前不支持**，因为它们改变了注意力结构
+（GQA/MQA 减少 KV 头数、AdaNorm 改归一化路径、HP-8 减少注意力头数），需要额外的 C++ 代码路径
+（独立的 KV 头 reshape、不同归一化算子等）：
+
+| 文件 | 不支持原因 |
+| --- | --- |
+| `student_r25_gqa4_adanorm.{fp32,q8_0}.gguf` | GQA-4（KV 头 4）+ AdaNorm 归一化 |
+| `student_r25_hp8_gqa4.{fp32,q8_0}.gguf` | HP-8（Q 头 8）+ GQA-4 |
+| `student_r25_hp8_gqa4_adanorm.{fp32,q4_k_m,q8_0}.gguf` | HP-8 + GQA-4 + AdaNorm |
+| `student_r25_hp8_mqa.q8_0.gguf` | HP-8 + MQA（KV 头 1） |
+
+这些变体在蒸馏仓库的 README.md 中**未提供质量指标**，因此即便适配也无法评估可用性。如需支持，
+需在 [infer.cpp](src/infer.cpp) 的 `decoder_layer()` 中读取 `llama.attention.head_count` /
+`head_count_kv` 元数据并按 GQA reshape K/V，欢迎贡献 PR。
+
+---
+
 ## API 概览 / API Overview
 
 | 导出 | 类型 | 说明 |
@@ -159,10 +241,10 @@ model.release();
 | --- | --- | --- |
 | `MEL_DIM` | 128 | mel 维度 |
 | `HIDDEN` | 1024 | hidden 维度 |
-| `NUM_LAYERS` | 22 | 解码器层数 |
+| `NUM_LAYERS` | 22（默认） | 解码器层数；按模型变体而变（教师=22，蒸馏基准=11，4 层学生=4）。运行时从 GGUF 元数据 `llama.block_count` 读取，缺失时回退到张量计数，再回退到默认 22 |
 | `NUM_HEADS` | 16 | 注意力头数 |
 | `HEAD_DIM` | 64 | 每头维度（= 1024 / 16） |
-| `INTERMEDIATE` | 4096 | FFN 中间维度（= 4 * hidden） |
+| `INTERMEDIATE` | 4096（默认） | FFN 中间维度；剪枝学生变体使用 1024（Prune75%）或 2048（Prune50%）。C++ 路径不直接引用此值——FFN 中间维度由 `ggml_mul_mat` 从 `blk.N.ffn_gate.weight` 张量 shape 隐式推断，因此剪枝变体无需代码改动即可工作 |
 | `RMS_EPS` | 1e-6 | RMSNorm epsilon |
 | `ROPE_THETA` | 10000 | RoPE base theta |
 

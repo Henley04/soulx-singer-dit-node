@@ -9,12 +9,12 @@
     "test": "node test/smoke.js"
   },
   "optionalDependencies": {
-    "soulx-singer-dit-win32-x64-cpu": "^0.2.0",
-    "soulx-singer-dit-win32-x64-vulkan": "^0.2.0",
-    "soulx-singer-dit-win32-x64-cuda": "^0.2.0",
-    "soulx-singer-dit-linux-x64-cpu": "^0.2.0",
+    "soulx-singer-dit-darwin-arm64-cpu": "^0.2.0",
     "soulx-singer-dit-linux-arm64-cpu": "^0.2.0",
-    "soulx-singer-dit-darwin-arm64-cpu": "^0.2.0"
+    "soulx-singer-dit-linux-x64-cpu": "^0.2.0",
+    "soulx-singer-dit-win32-x64-cpu": "^0.2.0",
+    "soulx-singer-dit-win32-x64-cuda": "^0.2.0",
+    "soulx-singer-dit-win32-x64-vulkan": "^0.2.0"
   },
   "files": [
     "index.js",
