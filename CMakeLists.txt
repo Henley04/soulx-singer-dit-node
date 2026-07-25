@@ -90,27 +90,38 @@ endif()
 # CUDA graphs: capture the per-step graph once and replay it, eliminating
 # per-kernel launch overhead (22 layers x dozens of kernels per step).
 #
-# Target CUDA architectures: covers the full range from Pascal (GTX 10xx,
-# compute capability 6.0) through Blackwell (RTX 50xx / GB10 DGX Spark,
-# compute capability 12.1).
+# Target CUDA architectures: Turing (RTX 20xx, CC 7.5) through Blackwell
+# (RTX 50xx / GB10 DGX Spark, CC 12.1). CC < 7.5 (Pascal/Volta) is NOT
+# compiled — those GPUs fall back to the CPU backend at runtime. CUDA 13.0
+# will hard-remove nvcc support for CC < 7.5 anyway, so omitting them now is
+# forward-compatible.
+#
+# CUBIN + PTX strategy (the standard two-stage CUDA compilation model):
+#   - CUBIN (SASS, via the -real suffix): a real binary per arch that uses
+#     THAT arch's hardware features (Tensor Cores, new instructions, etc.)
+#     for maximum acceleration. One CUBIN per listed arch.
+#   - PTX (virtual, from the unsuffixed entries): an intermediate IR that the
+#     driver JIT-compiles at load time. PTX is forward-compatible — compute_X
+#     PTX runs on any sm_Y where Y >= X. We ship two PTXs:
+#       * compute_100 (from `100`): covers Blackwell sub-archs we did NOT
+#         ship a CUBIN for (sm_103, sm_110).
+#       * compute_121 (from `121`): covers future GPUs (sm_130+) using
+#         Blackwell features, so next-gen hardware still runs fast.
+#   Net: CUBIN for acceleration on known hardware, PTX for compatibility on
+#   unlisted sub-archs and future GPUs.
 #
 # sm_121 (DGX Spark / GB10) requires CUDA Toolkit 12.9+ — nvcc in 12.8 only
 # knew about sm_100/101/120. The CI workflow installs 12.9.0
-# (Jimver/cuda-toolkit). CUDA 12.9 also emits deprecation *warnings* for
-# CC < 7.5 (sm_60/61/70/72); these are expected and non-fatal — CUDA 13.0
-# will hard-remove those archs, at which point drop 60/61/70 from this list.
+# (Jimver/cuda-toolkit).
 #
-# Compiling ~11 architectures x dozens of ggml CUDA kernels (mmvq/mmq/conv/
-# norm/...) is expensive: nvcc takes ~1-2h on a 4-core CI runner. The build
-# workflow mitigates this with:
+# Compiling 8 CUBINs + 2 PTXs x dozens of ggml CUDA kernels (mmvq/mmq/conv/
+# norm/...) takes ~2-3h on a 4-core CI runner for the first cold build. The
+# build workflow mitigates this with:
 #   - ccache (CMAKE_{CXX,CUDA}_COMPILER_LAUNCHER=ccache) for incremental hits
 #   - bounded --parallel to avoid nvcc OOM
-#   - a generous job timeout-minutes so the first cold build can complete
-# Disable an arch you don't need locally with -DCMAKE_CUDA_ARCHITECTURES=...
+#   - timeout-minutes: 180 so the first cold build can complete
+# Override locally with -DCMAKE_CUDA_ARCHITECTURES=... if needed.
 #
-#   60  = Pascal      (GTX 10xx baseline)
-#   61  = Pascal      (GTX 1080/1070/1080 Ti)
-#   70  = Volta       (V100, Titan V)
 #   75  = Turing      (RTX 20xx, T4)
 #   80  = Ampere      (A100)
 #   86  = Ampere      (RTX 30xx, A10/A40)
@@ -122,8 +133,12 @@ endif()
 if(GGML_CUDA)
     set(GGML_CUDA_USE_GRAPHS ON CACHE BOOL "Use CUDA graph capture" FORCE)
     set(GGML_CUDA_ALL_ARCHS OFF CACHE BOOL "Build only the arch subset below" FORCE)
-    set(CMAKE_CUDA_ARCHITECTURES "60;61;70;75;80;86;89;90;100;120;121"
-        CACHE STRING "Target CUDA architectures (Pascal..Blackwell)" FORCE)
+    # -real = CUBIN/SASS only (acceleration on that specific arch).
+    # 100 / 121 (unsuffixed) = CUBIN + PTX; the compute_100 PTX covers
+    # unlisted Blackwell sub-archs (sm_103/sm_110) and the compute_121 PTX
+    # provides forward compatibility for future GPUs via driver JIT.
+    set(CMAKE_CUDA_ARCHITECTURES "75-real;80-real;86-real;89-real;90-real;100;120-real;121"
+        CACHE STRING "CUDA archs (Turing..Blackwell): CUBIN per arch + PTX for compat" FORCE)
 endif()
 
 # ---------------------------------------------------------------------------
