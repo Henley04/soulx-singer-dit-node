@@ -1,6 +1,6 @@
 {
   "name": "soulx-singer-dit-win32-x64-vulkan",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Prebuilt Vulkan backend for soulx-singer-dit (Windows x64)",
   "main": "index.js",
   "types": "index.d.ts",
