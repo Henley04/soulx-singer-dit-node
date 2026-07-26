@@ -1,6 +1,6 @@
 {
   "name": "soulx-singer-dit-win32-x64-cuda",
-  "version": "0.2.1",
+  "version": "0.2.0",
   "description": "Prebuilt CUDA backend for soulx-singer-dit (Windows x64)",
   "main": "index.js",
   "types": "index.d.ts",
@@ -12,7 +12,7 @@
   "author": "Henley04",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Henley04/soulx-singer-dit-node.git",
+    "url": "git+https://github.com/Henley04/soulx-singer-dit-node.git",
     "directory": "packages/win32-x64-cuda"
   }
 }
