@@ -27,14 +27,34 @@
 #endif
 
 // ---------------------------------------------------------------------------
-// Model hyperparameters (mirror convert_dit_to_gguf.py DIT_HPARAMS)
+// Model hyperparameters (mirror convert_dit_to_gguf.py DIT_HPARAMS).
+//
+// MEL_DIM / HIDDEN / NUM_HEADS / HEAD_DIM are architectural constants shared
+// by every SoulX-Singer DiT variant — teacher (22L), distilled students (4L
+// or 11L), pruned students (4L with FFN/MLP intermediate reduced to 1024 or
+// 2048) — so they stay constexpr. RMS_EPS / ROPE_THETA likewise.
+//
+// NUM_LAYERS and INTERMEDIATE *do* vary across variants, so NUM_LAYERS is
+// resolved per-model from the GGUF metadata at load time and stored on the
+// Model struct below (see `Model::num_layers`). The constexpr below is the
+// DEFAULT used for legacy teacher GGUFs that don't carry the metadata.
+// INTERMEDIATE is not referenced by the C++ path at all — the FFN intermediate
+// dimension is read implicitly from the `blk.N.ffn_gate.weight` tensor shape
+// via ggml_mul_mat, so pruned students (FFN=1024 or 2048) work without any
+// code change beyond the layer loop bound.
 // ---------------------------------------------------------------------------
 static constexpr int   MEL_DIM       = 128;
 static constexpr int   HIDDEN        = 1024;
-static constexpr int   NUM_LAYERS    = 22;
+static constexpr int   NUM_LAYERS    = 22;     // default for legacy teacher
+                                               // GGUFs; overridden at load
+                                               // time when the GGUF carries
+                                               // llama.block_count
 static constexpr int   NUM_HEADS     = 16;
 static constexpr int   HEAD_DIM      = 64;     // 1024 / 16
-static constexpr int   INTERMEDIATE  = 4096;   // 4 * hidden
+static constexpr int   INTERMEDIATE  = 4096;   // 4 * hidden (default; pruned
+                                               // students use 1024 or 2048.
+                                               // Not referenced by C++; FFN
+                                               // shapes come from GGUF.)
 static constexpr float RMS_EPS       = 1e-6f;
 static constexpr float ROPE_THETA    = 10000.0f;
 
@@ -101,6 +121,16 @@ struct Model {
     // built/refreshed by run_forward() through a const Model&. Owned raw
     // pointer freed in unload(); null means "not yet built".
     mutable GraphCache * graph_cache = nullptr;
+
+    // ---- Resolved per-model hyperparameters ----
+    // NUM_LAYERS varies across DiT variants (teacher=22, distilled
+    // baseline-distill=11, ProbeKD/HiddenMatch/On-Policy/Wass students=4).
+    // Resolved at load time from GGUF metadata (llama.block_count); falls
+    // back to counting `blk.N.attn_q.weight` tensors, then to the NUM_LAYERS
+    // constexpr (22) for legacy teacher GGUFs that carry neither. Used by
+    // dit_forward() to bound the decoder layer loop — the only architectural
+    // knob that changes between the supported variants.
+    int   num_layers   = NUM_LAYERS;
 
     bool load(const std::string & path_, const std::string & backend_pref = "");
     void unload();
