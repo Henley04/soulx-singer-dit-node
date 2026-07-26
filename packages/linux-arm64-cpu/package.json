@@ -1,6 +1,6 @@
 {
   "name": "soulx-singer-dit-linux-arm64-cpu",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Prebuilt CPU backend for soulx-singer-dit (Linux arm64, runtime NEON/i8mm/SVE dispatch)",
   "main": "index.js",
   "types": "index.d.ts",

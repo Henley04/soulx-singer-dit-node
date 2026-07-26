@@ -1,6 +1,6 @@
 {
   "name": "soulx-singer-dit",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Node.js bindings for SoulX-Singer-DiT GGUF inference (no dequantization, via modified llama.cpp)",
   "main": "index.js",
   "types": "index.d.ts",
@@ -9,12 +9,12 @@
     "test": "node test/smoke.js"
   },
   "optionalDependencies": {
-    "soulx-singer-dit-darwin-arm64-cpu": "^0.2.0",
-    "soulx-singer-dit-linux-arm64-cpu": "^0.2.0",
-    "soulx-singer-dit-linux-x64-cpu": "^0.2.0",
-    "soulx-singer-dit-win32-x64-cpu": "^0.2.0",
-    "soulx-singer-dit-win32-x64-cuda": "^0.2.0",
-    "soulx-singer-dit-win32-x64-vulkan": "^0.2.0"
+    "soulx-singer-dit-darwin-arm64-cpu": "^0.2.1",
+    "soulx-singer-dit-linux-arm64-cpu": "^0.2.1",
+    "soulx-singer-dit-linux-x64-cpu": "^0.2.1",
+    "soulx-singer-dit-win32-x64-cpu": "^0.2.1",
+    "soulx-singer-dit-win32-x64-cuda": "^0.2.1",
+    "soulx-singer-dit-win32-x64-vulkan": "^0.2.1"
   },
   "files": [
     "index.js",
